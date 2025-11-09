@@ -141,7 +141,6 @@ async def on_ready():
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     try:
-        # ignore bot's own reactions
         if payload.user_id == bot.user.id:
             return
 
@@ -149,44 +148,27 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not state:
             return
         if state["user_id"] != payload.user_id:
-            # Only the session owner can answer
             return
 
         emoji = str(payload.emoji)
         if emoji not in ("✅", "❌"):
             return
 
-        # simple de-dupe (same user/message within ~0.8s)
-        now = time.time()
-        key = (payload.message_id, payload.user_id)
-        if _last_handle.get(key, 0) + 0.8 > now:
-            return
-        _last_handle[key] = now
-
+        # Get a channel object (no need to fetch the old message)
         channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
-        try:
-            message = await channel.fetch_message(payload.message_id)
-        except Exception:
-            active_reviews.pop(payload.message_id, None)
-            return
-
         correct = (emoji == "✅")
         user_id = payload.user_id
         category_id = state["category_id"]
         card_id = state["card_id"]
 
         with SessionLocal() as db:
+            # Load current card & score rows
             card = db.query(Card).filter(Card.id == card_id).one_or_none()
             if not card:
-                # session invalid
-                active_reviews.pop(message.id, None)
-                try:
-                    await message.edit(content="This review session expired.", embed=None)
-                except Exception:
-                    pass
+                active_reviews.pop(payload.message_id, None)
+                await channel.send("This review session expired. Start again with `/reviewcards`.")
                 return
 
-            # score row
             score = db.query(SessionScore).filter(
                 SessionScore.user_id == str(user_id),
                 SessionScore.category_id == category_id
@@ -195,7 +177,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 score = SessionScore(user_id=str(user_id), category_id=category_id, points=0)
                 db.add(score)
 
-            # stat row
             stat = db.query(ReviewStat).filter(
                 ReviewStat.user_id == str(user_id),
                 ReviewStat.card_id == card_id
@@ -204,55 +185,61 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 stat = ReviewStat(user_id=str(user_id), card_id=card_id)
                 db.add(stat)
 
+            # Apply result
             delta = 5 if correct else -5
             if correct:
                 stat.rights += 1
             else:
                 stat.wrongs += 1
-
             stat.last_reviewed_at = datetime.utcnow()
             score.points += delta
             streak = mark_daily_activity(db, user_id)
             db.commit()
 
-            # win condition
+            # Win condition
             if score.points >= 100:
                 catname = card.category.name if card.category else "Review"
-                try:
-                    await message.edit(
-                        content=f"🎉 <@{user_id}> finished **{catname}** with 100 points! (Streak: {streak.current_streak}🔥)",
-                        embed=None
-                    )
-                except Exception:
-                    pass
+                await channel.send(
+                    f"🎉 <@{user_id}> finished **{catname}** with 100 points! (Streak: {streak.current_streak}🔥)"
+                )
                 score.points = 0
                 db.commit()
-                active_reviews.pop(message.id, None)
+                # End session: stop tracking the old message id
+                active_reviews.pop(payload.message_id, None)
                 return
 
-            # next card (edit same message)
-            next_card = _pick_next_card(db, user_id, category_id)
+            # Next card (send as a NEW message)
+            cards = db.query(Card).filter(Card.category_id == category_id).all()
+            stats = db.query(ReviewStat).filter(
+                ReviewStat.user_id == str(user_id),
+                ReviewStat.card_id.in_([c.id for c in cards])
+            ).all()
+            stats_by_id = {s.card_id: s for s in stats}
+            next_card = weighted_choice(cards, stats_by_id)
+
             catname = next_card.category.name if next_card.category else "Cards"
-            e = _embed(catname, next_card, score.points, streak.current_streak)
+            embed = discord.Embed(
+                title=f"Review: {catname}",
+                description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
+                color=discord.Color.green(),
+            )
+            embed.set_footer(text=f"Points: {score.points} — React with ✅ or ❌ — Streak: {streak.current_streak} day(s)")
 
-            # Update state
-            active_reviews[message.id] = {
-                "user_id": user_id,
-                "card_id": next_card.id,
-                "category_id": category_id,
-            }
+        # Send the next card as a brand new message
+        new_msg = await channel.send(embed=embed)
 
-        # Try to remove the user's reaction so they can react again on the same message
-        user = payload.member or bot.get_user(payload.user_id) or await bot.fetch_user(payload.user_id)
-        await _remove_user_reaction(message, emoji, user)
+        # Move the session to the new message id
+        active_reviews[new_msg.id] = {
+            "user_id": user_id,
+            "card_id": next_card.id,
+            "category_id": category_id,
+        }
 
-        try:
-            await message.edit(embed=e)
-        except Exception:
-            logging.exception("Failed to edit message to next card")
-
+        # We intentionally do NOT pre-add reactions.
+        # (If you want faster tapping, you can manually react again.)
     except Exception:
         logging.exception("raw_reaction handler error")
+
 
 # -----------------------------------------------------------------------------
 # Slash Commands (no buttons anywhere)
