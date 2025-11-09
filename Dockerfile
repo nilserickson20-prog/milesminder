@@ -1,17 +1,44 @@
-FROM python:3.11-slim
+# ---------------------------------------------------------------
+# 1. Base image
+# ---------------------------------------------------------------
+FROM python:3.11-slim AS base
 
-# install tzdata so ZoneInfo("America/New_York") works
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+# Set working directory
+WORKDIR /app
+
+# ---------------------------------------------------------------
+# 2. System dependencies
+# ---------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# ---------------------------------------------------------------
+# 3. Copy project files
+# ---------------------------------------------------------------
+# Copy requirements (if you have a separate file)
+COPY requirements.txt /app/requirements.txt
 
-COPY requirements.txt .
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY milesminder ./milesminder
+# Copy the rest of the app
+COPY . /app
 
-VOLUME ["/data"]
+# Copy any reward videos (optional)
+# This assumes you have /assets/rewards/... files in your repo
+# Remove if you're hosting videos remotely
+COPY assets/ /app/assets/
+
+# ---------------------------------------------------------------
+# 4. Environment setup
+# ---------------------------------------------------------------
+# Prevent Python from writing .pyc files and force stdout flush
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# ---------------------------------------------------------------
+# 5. Entrypoint
+# ---------------------------------------------------------------
 CMD ["python", "-m", "milesminder.bot"]
