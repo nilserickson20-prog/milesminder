@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 import random
+import time
 from datetime import datetime
 from typing import Optional, Dict, List
 
@@ -19,11 +20,14 @@ from .utils import (
     EASTERN,
 )
 
-logging.basicConfig(level=logging.INFO)
+# ------------------------------------------------------------------
+# Logging setup
+# ------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# -------------------------------
-# Robust env parsing
-# -------------------------------
+# ------------------------------------------------------------------
+# Environment variable parsing
+# ------------------------------------------------------------------
 def _env_int(name: str, default: int = 0) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -34,36 +38,35 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
-# Keep as string; we cast to int only right before using it with discord.Object
 GUILD_ID_RAW = os.environ.get("GUILD_ID")
 STREAK_CHANNEL_ID = _env_int("STREAK_CHANNEL_ID", 0)
 
-# -------------------------------
+# ------------------------------------------------------------------
 # Discord setup
-# -------------------------------
+# ------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = False
 intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Rotating streak recap messages
-STREAK_UP_LINES: List[str] = [
+STREAK_UP_LINES = [
     "Streak stays hot. Bring the heat today.",
     "Consistency is a superpower. Keep going.",
     "Another brick on the wall. 👷‍♀️",
     "Briefs before breakfast. Your future self approves.",
 ]
-STREAK_RESET_LINES: List[str] = [
+STREAK_RESET_LINES = [
     "Fresh docket. Start a new streak today.",
     "Yesterday’s gone—today’s your opening statement.",
     "Objection overruled: we resume!",
 ]
 
-# message_id -> { user_id, card_id, category_id }
 active_reviews: Dict[int, dict] = {}
 
-
+# ------------------------------------------------------------------
+# On ready: initialise DB and sync slash commands
+# ------------------------------------------------------------------
 @bot.event
 async def on_ready():
     init_db()
@@ -75,9 +78,8 @@ async def on_ready():
                 await bot.tree.sync(guild=guild)
                 logging.info("Slash commands synced to guild %s", guild_id)
             except ValueError:
-                # Fall back to global sync if GUILD_ID was not numeric
                 await bot.tree.sync()
-                logging.warning("GUILD_ID was not numeric; synced commands globally instead.")
+                logging.warning("GUILD_ID not numeric; synced globally instead.")
         else:
             await bot.tree.sync()
             logging.info("Global slash commands synced")
@@ -85,11 +87,9 @@ async def on_ready():
         logging.exception("Failed to sync commands: %s", e)
     logging.info("Logged in as %s", bot.user)
 
-
-# ------------------------------------------------------------
+# ------------------------------------------------------------------
 # Slash Commands
-# ------------------------------------------------------------
-
+# ------------------------------------------------------------------
 @bot.tree.command(description="Add a new category")
 @app_commands.describe(name="Category name, e.g. Criminal Law")
 async def addcategory(interaction: discord.Interaction, name: str):
@@ -110,10 +110,10 @@ async def addcategory(interaction: discord.Interaction, name: str):
 
 @bot.tree.command(description="Add a flashcard")
 @app_commands.describe(
-    card_number="Unique ID you choose (e.g. CRIM-001)",
-    question="The prompt/question/definition",
-    answer="The answer text",
-    category="Optional category name (must exist, or will be created)",
+    card_number="Unique ID (e.g. CRIM-001)",
+    question="Question or definition",
+    answer="Answer text",
+    category="Optional category name",
 )
 async def addcard(
     interaction: discord.Interaction,
@@ -138,18 +138,13 @@ async def addcard(
         db.add(card)
         db.commit()
         await interaction.response.send_message(
-            f"Added card **{card.card_number}** in category **{card.category.name if card.category else 'None'}**.",
+            f"Added card **{card.card_number}** in category "
+            f"**{card.category.name if card.category else 'None'}**.",
             ephemeral=True,
         )
 
 
 @bot.tree.command(description="Edit a flashcard by its unique number")
-@app_commands.describe(
-    card_number="Unique card number to edit",
-    question="New question (optional)",
-    answer="New answer (optional)",
-    category="New category (optional)",
-)
 async def editcard(
     interaction: discord.Interaction,
     card_number: str,
@@ -170,13 +165,10 @@ async def editcard(
             cat = get_or_create_category(db, category)
             card.category = cat
         db.commit()
-        await interaction.response.send_message(
-            f"Updated card **{card.card_number}**.", ephemeral=True
-        )
+        await interaction.response.send_message(f"Updated card **{card.card_number}**.", ephemeral=True)
 
 
 @bot.tree.command(description="Delete a flashcard by its unique number")
-@app_commands.describe(card_number="Unique card number to delete")
 async def deletecard(interaction: discord.Interaction, card_number: str):
     with SessionLocal() as db:
         card = db.query(Card).filter(Card.card_number == card_number.strip()).one_or_none()
@@ -188,6 +180,9 @@ async def deletecard(interaction: discord.Interaction, card_number: str):
         await interaction.response.send_message(f"Deleted card **{card_number}**.", ephemeral=True)
 
 
+# ------------------------------------------------------------------
+# List cards & review logic
+# ------------------------------------------------------------------
 class CardButton(discord.ui.Button):
     def __init__(self, label: str, card_number: str):
         super().__init__(label=label, style=discord.ButtonStyle.secondary)
@@ -217,7 +212,6 @@ class ListView(discord.ui.View):
 
 
 @bot.tree.command(description="List cards for a category (alphabetical by question)")
-@app_commands.describe(category="Category name to list")
 async def listcards(interaction: discord.Interaction, category: str):
     with SessionLocal() as db:
         cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
@@ -237,7 +231,6 @@ async def listcards(interaction: discord.Interaction, category: str):
 
 
 @bot.tree.command(description="Review cards from a category with weighted randomness")
-@app_commands.describe(category="Category to review (required)")
 async def reviewcards(interaction: discord.Interaction, category: str):
     user_id = interaction.user.id
     with SessionLocal() as db:
@@ -275,7 +268,9 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
             color=discord.Color.green(),
         )
-        embed.set_footer(text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak_val} day(s)")
+        embed.set_footer(
+            text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak_val} day(s)"
+        )
         await interaction.response.send_message(embed=embed)
         sent = await interaction.original_response()
         try:
@@ -286,6 +281,9 @@ async def reviewcards(interaction: discord.Interaction, category: str):
         active_reviews[sent.id] = {"user_id": user_id, "card_id": card.id, "category_id": cat.id}
 
 
+# ------------------------------------------------------------------
+# Reaction handling
+# ------------------------------------------------------------------
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
     if user.bot:
@@ -379,18 +377,15 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         active_reviews.pop(reaction.message.id, None)
 
 
-# ------------------------------------------------------------
+# ------------------------------------------------------------------
 # Streak commands and recap loop
-# ------------------------------------------------------------
-
+# ------------------------------------------------------------------
 @bot.tree.command(description="Show your review streak and longest streak")
 async def streak(interaction: discord.Interaction):
     with SessionLocal() as db:
         s = db.query(Streak).filter(Streak.user_id == str(interaction.user.id)).one_or_none()
         if not s:
-            await interaction.response.send_message(
-                "No streak yet. Start a /reviewcards to begin!", ephemeral=True
-            )
+            await interaction.response.send_message("No streak yet. Start a /reviewcards to begin!", ephemeral=True)
             return
         await interaction.response.send_message(
             f"🔥 **Current streak:** {s.current_streak} day(s)\n🏆 **Longest streak:** {s.longest_streak} day(s)",
@@ -460,9 +455,18 @@ async def daily_streak_recap_loop():
             continue
 
 
+# ------------------------------------------------------------------
+# Entry point with visible error logging for Fly
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN env var is required")
-    # fire-and-forget the daily recap task
-    bot.loop.create_task(daily_streak_recap_loop())
-    bot.run(TOKEN)
+        logging.error("DISCORD_TOKEN is missing (set it in Fly secrets).")
+        time.sleep(60)
+        raise SystemExit(1)
+    try:
+        bot.loop.create_task(daily_streak_recap_loop())
+        bot.run(TOKEN)
+    except Exception:
+        logging.exception("Fatal error during startup")
+        time.sleep(60)
+        raise
