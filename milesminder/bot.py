@@ -69,8 +69,8 @@ STREAK_RESET_LINES = [
 # -----------------------------------------------------------------------------
 active_reviews: Dict[int, dict] = {}
 
-# tiny de-dupe to avoid double-fires
-_last_handle: Dict[Tuple[int, int], float] = {}  # (message_id, user_id) -> ts
+# tiny de-dupe to avoid double-fires (message_id, user_id) -> ts
+_last_handle: Dict[Tuple[int, int], float] = {}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -88,7 +88,7 @@ def _embed(catname: str, card: Card, points: int, streak_val: int) -> discord.Em
         description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
         color=discord.Color.green(),
     )
-    e.set_footer(text=f"Points: {points} — React with ✅ or ❌ — Streak: {streak_val} day(s)")
+    e.set_footer(text=f"Points: {points} — React ✅/❌ or use buttons — Streak: {streak_val} day(s)")
     return e
 
 def _pick_next_card(db, user_id: int, category_id: int) -> Card:
@@ -99,6 +99,136 @@ def _pick_next_card(db, user_id: int, category_id: int) -> Card:
     ).all()
     stats_by_id = {s.card_id: s for s in stats}
     return weighted_choice(cards, stats_by_id)
+
+async def _post_next_card(channel: discord.abc.Messageable, user_id: int, category_id: int, points: int, streak_val: int):
+    """Pick next card and send as a NEW message with buttons; return (message, card)."""
+    with SessionLocal() as db:
+        next_card = _pick_next_card(db, user_id, category_id)
+        catname = next_card.category.name if next_card.category else "Cards"
+        embed = _embed(catname, next_card, points, streak_val)
+
+    view = ReviewView(user_id=user_id, category_id=category_id, card_id=next_card.id)
+    new_msg = await channel.send(embed=embed, view=view)
+    active_reviews[new_msg.id] = {"user_id": user_id, "card_id": next_card.id, "category_id": category_id}
+    return new_msg, next_card
+
+async def _score_and_advance(
+    *,
+    channel: discord.abc.Messageable,
+    old_message: Optional[discord.Message],
+    user_id: int,
+    category_id: int,
+    card_id: int,
+    correct: bool,
+):
+    """Score this card, check win, then send a NEW message with next card. Disable old view / ignore errors."""
+    with SessionLocal() as db:
+        card = db.query(Card).filter(Card.id == card_id).one_or_none()
+        if not card:
+            if old_message:
+                try:
+                    await old_message.edit(content="This review session expired.", embed=None, view=None)
+                except Exception:
+                    pass
+            return
+
+        score = db.query(SessionScore).filter(
+            SessionScore.user_id == str(user_id),
+            SessionScore.category_id == category_id
+        ).one_or_none()
+        if not score:
+            score = SessionScore(user_id=str(user_id), category_id=category_id, points=0)
+            db.add(score)
+
+        stat = db.query(ReviewStat).filter(
+            ReviewStat.user_id == str(user_id),
+            ReviewStat.card_id == card_id
+        ).one_or_none()
+        if not stat:
+            stat = ReviewStat(user_id=str(user_id), card_id=card_id, rights=0, wrongs=0)
+            db.add(stat)
+        else:
+            stat.rights = stat.rights or 0
+            stat.wrongs = stat.wrongs or 0
+
+        delta = 5 if correct else -5
+        if correct:
+            stat.rights += 1
+        else:
+            stat.wrongs += 1
+
+        stat.last_reviewed_at = datetime.utcnow()
+        score.points += delta
+        streak = mark_daily_activity(db, user_id)
+        db.commit()
+
+        # Win condition
+        if score.points >= 100:
+            catname = card.category.name if card.category else "Review"
+            await channel.send(
+                f"🎉 <@{user_id}> finished **{catname}** with 100 points! (Streak: {streak.current_streak}🔥)"
+            )
+            score.points = 0
+            db.commit()
+            # Disable old view if present
+            if old_message:
+                try:
+                    await old_message.edit(view=None)
+                except Exception:
+                    pass
+            return
+
+        # Otherwise send the next card
+        new_msg, _ = await _post_next_card(
+            channel=channel,
+            user_id=user_id,
+            category_id=category_id,
+            points=score.points,
+            streak_val=streak.current_streak,
+        )
+
+    # Tidy old message (remove its view so we don't accept double clicks)
+    if old_message:
+        try:
+            await old_message.edit(view=None)
+        except Exception:
+            pass
+
+# -----------------------------------------------------------------------------
+# Buttons View
+# -----------------------------------------------------------------------------
+class ReviewView(discord.ui.View):
+    def __init__(self, user_id: int, category_id: int, card_id: int):
+        super().__init__(timeout=1200)  # 20 minutes
+        self.user_id = user_id
+        self.category_id = category_id
+        self.card_id = card_id
+
+    async def _handle(self, interaction: discord.Interaction, correct: bool):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn’t your review session.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer()
+        except discord.InteractionResponded:
+            pass
+
+        await _score_and_advance(
+            channel=interaction.channel,
+            old_message=interaction.message,
+            user_id=self.user_id,
+            category_id=self.category_id,
+            card_id=self.card_id,
+            correct=correct,
+        )
+
+    @discord.ui.button(label="✅ Correct", style=discord.ButtonStyle.success)
+    async def btn_correct(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle(interaction, True)
+
+    @discord.ui.button(label="❌ Incorrect", style=discord.ButtonStyle.danger)
+    async def btn_incorrect(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle(interaction, False)
 
 # -----------------------------------------------------------------------------
 # Events
@@ -134,13 +264,12 @@ async def on_ready():
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     """
-    Reaction-only advancement:
-      • We do NOT fetch/edit the old message (avoids Read History/edit perms).
-      • We score then SEND A NEW MESSAGE with the next card.
+    Reaction path:
+      • We DO NOT edit the old message.
+      • We score, then SEND A NEW MESSAGE with the next card + buttons.
       • We move the session mapping to the new message id.
     """
     try:
-        # ignore bot's own reactions
         if payload.user_id == bot.user.id:
             return
 
@@ -148,7 +277,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not state:
             return
         if state["user_id"] != payload.user_id:
-            # Only the session owner can answer this message
             return
 
         emoji = str(payload.emoji)
@@ -168,85 +296,32 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         category_id = state["category_id"]
         card_id = state["card_id"]
 
-        with SessionLocal() as db:
-            # Load current card & score rows
-            card = db.query(Card).filter(Card.id == card_id).one_or_none()
-            if not card:
-                active_reviews.pop(payload.message_id, None)
-                await channel.send("This review session expired. Start again with `/reviewcards`.")
-                return
+        # We don't need the old message to advance; just disable its view if we can fetch it.
+        old_message = None
+        try:
+            ch = channel
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                old_message = await ch.fetch_message(payload.message_id)
+        except Exception:
+            pass
 
-            score = db.query(SessionScore).filter(
-                SessionScore.user_id == str(user_id),
-                SessionScore.category_id == category_id
-            ).one_or_none()
-            if not score:
-                score = SessionScore(user_id=str(user_id), category_id=category_id, points=0)
-                db.add(score)
+        await _score_and_advance(
+            channel=channel,
+            old_message=old_message,
+            user_id=user_id,
+            category_id=category_id,
+            card_id=card_id,
+            correct=correct,
+        )
 
-            stat = db.query(ReviewStat).filter(
-                ReviewStat.user_id == str(user_id),
-                ReviewStat.card_id == card_id
-            ).one_or_none()
-            if not stat:
-                # ensure integers at creation
-                stat = ReviewStat(user_id=str(user_id), card_id=card_id, rights=0, wrongs=0)
-                db.add(stat)
-            else:
-                # sanitize legacy rows that may have None
-                stat.rights = stat.rights or 0
-                stat.wrongs = stat.wrongs or 0
-
-            # Apply result
-            delta = 5 if correct else -5
-            if correct:
-                stat.rights += 1
-            else:
-                stat.wrongs += 1
-            stat.last_reviewed_at = datetime.utcnow()
-            score.points += delta
-            streak = mark_daily_activity(db, user_id)
-            db.commit()
-
-            # Win condition
-            if score.points >= 100:
-                catname = card.category.name if card.category else "Review"
-                await channel.send(
-                    f"🎉 <@{user_id}> finished **{catname}** with 100 points! (Streak: {streak.current_streak}🔥)"
-                )
-                score.points = 0
-                db.commit()
-                # End session: stop tracking the old message id
-                active_reviews.pop(payload.message_id, None)
-                return
-
-            # Next card (send as a NEW message)
-            next_card = _pick_next_card(db, user_id, category_id)
-            catname = next_card.category.name if next_card.category else "Cards"
-            embed = discord.Embed(
-                title=f"Review: {catname}",
-                description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
-                color=discord.Color.green(),
-            )
-            embed.set_footer(text=f"Points: {score.points} — React with ✅ or ❌ — Streak: {streak.current_streak} day(s)")
-
-        # Send the next card as a brand new message
-        new_msg = await channel.send(embed=embed)
-
-        # Move the session to the new message id
-        active_reviews[new_msg.id] = {
-            "user_id": user_id,
-            "card_id": next_card.id,
-            "category_id": category_id,
-        }
-
-        # We intentionally do NOT pre-add reactions.
+        # Move state will be handled in _post_next_card; also clear old id
+        active_reviews.pop(payload.message_id, None)
 
     except Exception:
         logging.exception("raw_reaction handler error")
 
 # -----------------------------------------------------------------------------
-# Slash Commands (reaction-only workflow; no buttons anywhere)
+# Slash Commands
 # -----------------------------------------------------------------------------
 @bot.tree.command(description="Add a new category")
 @app_commands.describe(name="Category name, e.g. Criminal Law")
@@ -284,13 +359,14 @@ async def addcard(
             answer=answer.strip(),
             category=cat,
         )
-        db.add(card)
-        db.commit()
-        await interaction.response.send_message(
-            f"Added card **{card.card_number}** in "
-            f"**{card.category.name if card.category else 'No Category'}**.",
-            ephemeral=True,
-        )
+    with SessionLocal() as db2:
+        db2.add(card)
+        db2.commit()
+    await interaction.response.send_message(
+        f"Added card **{card.card_number}** in "
+        f"**{card.category.name if card.category else 'No Category'}**.",
+        ephemeral=True,
+    )
 
 # ---- AUTOCOMPLETE 1: addcard(category) --------------------------------------
 @addcard.autocomplete("category")
@@ -313,7 +389,7 @@ async def listcards(interaction: discord.Interaction, category: str):
         lines = [f"• **{c.card_number}** — {c.question}" for c in cards[:200]]
         await interaction.response.send_message(f"**{cat.name}** — {len(cards)} card(s):\n" + "\n".join(lines), ephemeral=True)
 
-@bot.tree.command(description="Start a reaction-based review session (react with ✅ or ❌)")
+@bot.tree.command(description="Start a review session (buttons + optional reactions)")
 @app_commands.describe(category="Category to review")
 async def reviewcards(interaction: discord.Interaction, category: str):
     user_id = interaction.user.id
@@ -327,7 +403,6 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             await interaction.response.send_message("No cards in that category.", ephemeral=True)
             return
 
-        # ensure a score row exists
         score = db.query(SessionScore).filter(
             SessionScore.user_id == str(user_id),
             SessionScore.category_id == cat.id
@@ -345,12 +420,13 @@ async def reviewcards(interaction: discord.Interaction, category: str):
         embed = _embed(cat.name, first_card, score.points, streak_val)
 
     await interaction.response.send_message(
-        "Review started. React to the card with **✅** for correct or **❌** for incorrect.",
+        "Review started. Use the buttons **or** react with ✅/❌.",
         ephemeral=True,
     )
-    sent = await interaction.channel.send(embed=embed)
+    view = ReviewView(user_id=user_id, category_id=cat.id, card_id=first_card.id)
+    sent = await interaction.channel.send(embed=embed, view=view)
 
-    # IMPORTANT: do NOT pre-add reactions (per your request)
+    # Do NOT pre-add reactions; user can add them manually.
     active_reviews[sent.id] = {"user_id": user_id, "card_id": first_card.id, "category_id": cat.id}
 
 # ---- AUTOCOMPLETE 2: reviewcards(category) ----------------------------------
