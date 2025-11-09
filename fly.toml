@@ -7,27 +7,9 @@ primary_region = "iad"
 [env]
   DB_PATH = "/data/milesminder.db"
 
-# Mount persistent volume for the SQLite database
 [[mounts]]
   source = "milesminder_data"
   destination = "/data"
 
-# Run the Discord bot process
 [processes]
   app = "python -m milesminder.bot"
-
-# Disable the HTTP proxy checks (this is key for worker apps)
-[experimental]
-  auto_rollback = true
-  cmd = ["python", "-m", "milesminder.bot"]
-  entrypoint = ["python"]
-  exec = ["-m", "milesminder.bot"]
-
-# Optional concurrency limits for worker-style apps
-[checks]
-  [checks.health]
-    type = "tcp"
-    port = 8080
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "10s"
