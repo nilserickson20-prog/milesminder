@@ -21,10 +21,26 @@ from .utils import (
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.environ.get("DISCORD_TOKEN")
-GUILD_ID = os.environ.get("GUILD_ID")  # optional: limit to one server
-STREAK_CHANNEL_ID = int(os.environ.get("STREAK_CHANNEL_ID", "0"))
+# -------------------------------
+# Robust env parsing
+# -------------------------------
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
 
+TOKEN = os.environ.get("DISCORD_TOKEN")
+# Keep as string; we cast to int only right before using it with discord.Object
+GUILD_ID_RAW = os.environ.get("GUILD_ID")
+STREAK_CHANNEL_ID = _env_int("STREAK_CHANNEL_ID", 0)
+
+# -------------------------------
+# Discord setup
+# -------------------------------
 intents = discord.Intents.default()
 intents.message_content = False
 intents.reactions = True
@@ -44,6 +60,7 @@ STREAK_RESET_LINES: List[str] = [
     "Objection overruled: we resume!",
 ]
 
+# message_id -> { user_id, card_id, category_id }
 active_reviews: Dict[int, dict] = {}
 
 
@@ -51,10 +68,16 @@ active_reviews: Dict[int, dict] = {}
 async def on_ready():
     init_db()
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            await bot.tree.sync(guild=guild)
-            logging.info("Slash commands synced to guild %s", GUILD_ID)
+        if GUILD_ID_RAW:
+            try:
+                guild_id = int(str(GUILD_ID_RAW).strip())
+                guild = discord.Object(id=guild_id)
+                await bot.tree.sync(guild=guild)
+                logging.info("Slash commands synced to guild %s", guild_id)
+            except ValueError:
+                # Fall back to global sync if GUILD_ID was not numeric
+                await bot.tree.sync()
+                logging.warning("GUILD_ID was not numeric; synced commands globally instead.")
         else:
             await bot.tree.sync()
             logging.info("Global slash commands synced")
@@ -440,5 +463,6 @@ async def daily_streak_recap_loop():
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN env var is required")
+    # fire-and-forget the daily recap task
     bot.loop.create_task(daily_streak_recap_loop())
     bot.run(TOKEN)
