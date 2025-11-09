@@ -46,9 +46,10 @@ STREAK_CHANNEL_ID = _env_int("STREAK_CHANNEL_ID", 0)
 # Discord client
 # -----------------------------------------------------------
 intents = discord.Intents.default()
+intents.guilds = True
+intents.messages = True
 intents.reactions = True
 intents.message_content = False
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 STREAK_UP_LINES = [
@@ -66,7 +67,7 @@ STREAK_RESET_LINES = [
 active_reviews: Dict[int, dict] = {}
 
 # -----------------------------------------------------------
-# on_ready (setup + sync + streak task)
+# on_ready
 # -----------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -97,6 +98,16 @@ async def on_ready():
         asyncio.create_task(daily_streak_recap_loop())
 
 # -----------------------------------------------------------
+# Category autocomplete helper
+# -----------------------------------------------------------
+def _fetch_category_names(prefix: str = "", limit: int = 25):
+    with SessionLocal() as db:
+        q = db.query(Category)
+        if prefix:
+            q = q.filter(Category.name.ilike(f"{prefix.strip()}%"))
+        return [c.name for c in q.order_by(Category.name.asc()).limit(limit).all()]
+
+# -----------------------------------------------------------
 # Slash Commands
 # -----------------------------------------------------------
 @bot.tree.command(description="Add a new category")
@@ -113,7 +124,6 @@ async def addcategory(interaction: discord.Interaction, name: str):
         db.add(cat)
         db.commit()
         await interaction.response.send_message(f"Created category **{cat.name}**.", ephemeral=True)
-
 
 @bot.tree.command(description="Add a flashcard (auto-generates unique card number)")
 @app_commands.describe(
@@ -144,91 +154,10 @@ async def addcard(
             ephemeral=True,
         )
 
-
-@bot.tree.command(description="Edit a flashcard")
-async def editcard(
-    interaction: discord.Interaction,
-    card_number: str,
-    question: Optional[str] = None,
-    answer: Optional[str] = None,
-    category: Optional[str] = None,
-):
-    with SessionLocal() as db:
-        card = db.query(Card).filter(Card.card_number == card_number.strip()).one_or_none()
-        if not card:
-            await interaction.response.send_message("Card not found.", ephemeral=True)
-            return
-        if question:
-            card.question = question.strip()
-        if answer:
-            card.answer = answer.strip()
-        if category is not None:
-            cat = get_or_create_category(db, category)
-            card.category = cat
-        db.commit()
-        await interaction.response.send_message(f"Updated card **{card.card_number}**.", ephemeral=True)
-
-
-@bot.tree.command(description="Delete a flashcard by its unique number")
-async def deletecard(interaction: discord.Interaction, card_number: str):
-    with SessionLocal() as db:
-        card = db.query(Card).filter(Card.card_number == card_number.strip()).one_or_none()
-        if not card:
-            await interaction.response.send_message("Card not found.", ephemeral=True)
-            return
-        db.delete(card)
-        db.commit()
-        await interaction.response.send_message(f"Deleted card **{card_number}**.", ephemeral=True)
-
-# -----------------------------------------------------------
-# List cards + review system
-# -----------------------------------------------------------
-class CardButton(discord.ui.Button):
-    def __init__(self, label: str, card_number: str):
-        super().__init__(label=label, style=discord.ButtonStyle.secondary)
-        self.card_number = card_number
-
-    async def callback(self, interaction: discord.Interaction):
-        with SessionLocal() as db:
-            card = db.query(Card).filter(Card.card_number == self.card_number).one_or_none()
-            if not card:
-                await interaction.response.send_message("That card no longer exists.", ephemeral=True)
-                return
-            embed = discord.Embed(
-                title=f"Card {card.card_number}",
-                description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
-                color=discord.Color.blurple(),
-            )
-            if card.category:
-                embed.set_footer(text=f"Category: {card.category.name}")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class ListView(discord.ui.View):
-    def __init__(self, cards: list[Card]):
-        super().__init__(timeout=60)
-        for c in cards[:25]:
-            self.add_item(CardButton(label=c.question[:80], card_number=c.card_number))
-
-
-@bot.tree.command(description="List cards for a category")
-async def listcards(interaction: discord.Interaction, category: str):
-    with SessionLocal() as db:
-        cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
-        if not cat:
-            await interaction.response.send_message("Category not found.", ephemeral=True)
-            return
-        cards = db.query(Card).filter(Card.category_id == cat.id).order_by(Card.question.asc()).all()
-        if not cards:
-            await interaction.response.send_message("No cards in that category.", ephemeral=True)
-            return
-        view = ListView(cards)
-        await interaction.response.send_message(
-            f"**{cat.name}** — {len(cards)} card(s). Click a question to open:",
-            view=view,
-            ephemeral=True,
-        )
-
+@addcard.autocomplete("category")
+async def addcard_category_autocomplete(interaction, current: str):
+    names = _fetch_category_names(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
 
 @bot.tree.command(description="Review cards from a category")
 async def reviewcards(interaction: discord.Interaction, category: str):
@@ -271,7 +200,7 @@ async def reviewcards(interaction: discord.Interaction, category: str):
         embed.set_footer(
             text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak_val} day(s)"
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
         sent = await interaction.original_response()
         try:
             await sent.add_reaction("✅")
@@ -280,34 +209,65 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             pass
         active_reviews[sent.id] = {"user_id": user_id, "card_id": card.id, "category_id": cat.id}
 
+@reviewcards.autocomplete("category")
+async def reviewcards_category_autocomplete(interaction, current: str):
+    names = _fetch_category_names(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
+
 # -----------------------------------------------------------
-# Reaction add (score + next card)
+# Reaction handler (robust)
 # -----------------------------------------------------------
 @bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
-    if user.bot:
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
         return
-    payload = active_reviews.get(reaction.message.id)
-    if not payload or payload["user_id"] != user.id:
+
+    review_state = active_reviews.get(payload.message_id)
+    if not review_state or review_state["user_id"] != payload.user_id:
         return
-    emoji = str(reaction.emoji)
-    with SessionLocal() as db:
-        card = db.query(Card).filter(Card.id == payload["card_id"]).one_or_none()
-        if not card:
+
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except Exception:
             return
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.NotFound:
+        active_reviews.pop(payload.message_id, None)
+        return
+    except Exception:
+        return
+
+    emoji = str(payload.emoji)
+
+    with SessionLocal() as db:
+        card = db.query(Card).filter(Card.id == review_state["card_id"]).one_or_none()
+        if not card:
+            active_reviews.pop(payload.message_id, None)
+            return
+
         stat = db.query(ReviewStat).filter(
-            ReviewStat.user_id == str(user.id), ReviewStat.card_id == card.id
+            ReviewStat.user_id == str(payload.user_id),
+            ReviewStat.card_id == card.id
         ).one_or_none()
         if not stat:
-            stat = ReviewStat(user_id=str(user.id), card_id=card.id)
+            stat = ReviewStat(user_id=str(payload.user_id), card_id=card.id)
             db.add(stat)
+
         score = db.query(SessionScore).filter(
-            SessionScore.user_id == str(user.id),
-            SessionScore.category_id == payload["category_id"]
+            SessionScore.user_id == str(payload.user_id),
+            SessionScore.category_id == review_state["category_id"]
         ).one_or_none()
         if not score:
-            score = SessionScore(user_id=str(user.id), category_id=payload["category_id"], points=0)
+            score = SessionScore(user_id=str(payload.user_id),
+                                  category_id=review_state["category_id"],
+                                  points=0)
             db.add(score)
+
         delta = 0
         if emoji == "✅":
             stat.rights += 1
@@ -317,34 +277,41 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
             delta = -5
         else:
             return
+
         stat.last_reviewed_at = datetime.utcnow()
         score.points += delta
-        streak = mark_daily_activity(db, user.id)
+        streak = mark_daily_activity(db, payload.user_id)
         db.commit()
+
         try:
-            embed = reaction.message.embeds[0]
-            embed.set_footer(
-                text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak.current_streak} day(s)"
-            )
-            await reaction.message.edit(embed=embed)
+            if message.embeds:
+                embed = message.embeds[0]
+                embed.set_footer(
+                    text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak.current_streak} day(s)"
+                )
+                await message.edit(embed=embed)
         except Exception:
             pass
+
         if score.points >= 100:
-            await reaction.message.channel.send(
-                f"🎉 <@{user.id}> finished **{card.category.name if card.category else 'Review'}** "
-                f"with 100 points! (Streak: {streak.current_streak}🔥)"
+            cat = card.category.name if card.category else "Review"
+            await channel.send(
+                f"🎉 <@{payload.user_id}> finished **{cat}** with 100 points! "
+                f"(Streak: {streak.current_streak}🔥)"
             )
             score.points = 0
             db.commit()
-            active_reviews.pop(reaction.message.id, None)
+            active_reviews.pop(payload.message_id, None)
             return
-        cards = db.query(Card).filter(Card.category_id == payload["category_id"]).all()
+
+        cards = db.query(Card).filter(Card.category_id == review_state["category_id"]).all()
         stats = db.query(ReviewStat).filter(
-            ReviewStat.user_id == str(user.id),
+            ReviewStat.user_id == str(payload.user_id),
             ReviewStat.card_id.in_([c.id for c in cards])
         ).all()
         stats_by_id = {s.card_id: s for s in stats}
         next_card = weighted_choice(cards, stats_by_id)
+
         embed = discord.Embed(
             title=f"Review: {card.category.name if card.category else 'Cards'}",
             description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
@@ -353,34 +320,39 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         embed.set_footer(
             text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak.current_streak} day(s)"
         )
-        new_msg = await reaction.message.channel.send(embed=embed)
+
+        new_msg = await channel.send(embed=embed)
         try:
             await new_msg.add_reaction("✅")
             await new_msg.add_reaction("❌")
         except discord.Forbidden:
             pass
+
         active_reviews[new_msg.id] = {
-            "user_id": user.id,
+            "user_id": payload.user_id,
             "card_id": next_card.id,
-            "category_id": payload["category_id"],
+            "category_id": review_state["category_id"],
         }
-        active_reviews.pop(reaction.message.id, None)
+        active_reviews.pop(payload.message_id, None)
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
 # -----------------------------------------------------------
-# Streak commands
+# Streak commands + recap loop
 # -----------------------------------------------------------
 @bot.tree.command(description="Show your current and longest streak")
 async def streak(interaction: discord.Interaction):
     with SessionLocal() as db:
         s = db.query(Streak).filter(Streak.user_id == str(interaction.user.id)).one_or_none()
         if not s:
-            await interaction.response.send_message("No streak yet. Start reviewing to begin!", ephemeral=True)
+            await interaction.response.send_message("No streak yet. Start reviewing!", ephemeral=True)
             return
         await interaction.response.send_message(
             f"🔥 **Current:** {s.current_streak} days\n🏆 **Longest:** {s.longest_streak} days",
             ephemeral=True,
         )
-
 
 @bot.tree.command(description="Show the longest streak leaderboard")
 async def streakboard(interaction: discord.Interaction):
@@ -395,16 +367,12 @@ async def streakboard(interaction: discord.Interaction):
         ]
         await interaction.response.send_message("\n".join(lines))
 
-# -----------------------------------------------------------
-# Daily recap loop
-# -----------------------------------------------------------
 async def sleep_until_next_3am_eastern():
     now_et = datetime.now(EASTERN)
     target = now_et.replace(hour=3, minute=0, second=0, microsecond=0)
     if now_et >= target:
         target += timedelta(days=1)
     await asyncio.sleep((target - now_et).total_seconds())
-
 
 async def daily_streak_recap_loop():
     await bot.wait_until_ready()
@@ -416,24 +384,24 @@ async def daily_streak_recap_loop():
         try:
             channel = bot.get_channel(STREAK_CHANNEL_ID)
             if not channel:
-                logging.warning("STREAK_CHANNEL_ID not found in cache.")
+                logging.warning("STREAK_CHANNEL_ID not found.")
                 continue
             with SessionLocal() as db:
                 today = datetime.now(EASTERN).date()
                 yesterday = (today - timedelta(days=1)).isoformat()
                 actives = db.query(Streak).filter(Streak.last_active_date == yesterday).all()
                 resets = db.query(Streak).filter(Streak.last_active_date != yesterday).all()
-                lines: list[str] = []
+                lines = []
                 if actives:
                     lines.append(
-                        "**🔥 Still rolling:** "
-                        + ", ".join([f"<@{s.user_id}> ({s.current_streak}d)" for s in actives])
+                        "**🔥 Still rolling:** " +
+                        ", ".join([f"<@{s.user_id}> ({s.current_streak}d)" for s in actives])
                     )
                     lines.append(random.choice(STREAK_UP_LINES))
                 if resets:
                     lines.append(
-                        "\n**↩️ Needs a new start:** "
-                        + ", ".join([f"<@{s.user_id}>" for s in resets])
+                        "\n**↩️ Needs a new start:** " +
+                        ", ".join([f"<@{s.user_id}>" for s in resets])
                     )
                     lines.append(random.choice(STREAK_RESET_LINES))
                 if not lines:
