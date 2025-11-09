@@ -65,7 +65,7 @@ STREAK_RESET_LINES = [
 active_reviews: Dict[int, dict] = {}
 
 # ------------------------------------------------------------------
-# On ready: initialise DB and sync slash commands
+# On ready: initialise DB, sync commands, start background task
 # ------------------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -86,6 +86,11 @@ async def on_ready():
     except Exception as e:
         logging.exception("Failed to sync commands: %s", e)
     logging.info("Logged in as %s", bot.user)
+
+    # ✅ Start the daily recap loop once (discord.py 2.x safe)
+    if not getattr(bot, "_recap_started", False):
+        bot._recap_started = True
+        asyncio.create_task(daily_streak_recap_loop())
 
 # ------------------------------------------------------------------
 # Slash Commands
@@ -145,6 +150,12 @@ async def addcard(
 
 
 @bot.tree.command(description="Edit a flashcard by its unique number")
+@app_commands.describe(
+    card_number="Unique card number to edit",
+    question="New question (optional)",
+    answer="New answer (optional)",
+    category="New category (optional)",
+)
 async def editcard(
     interaction: discord.Interaction,
     card_number: str,
@@ -169,6 +180,7 @@ async def editcard(
 
 
 @bot.tree.command(description="Delete a flashcard by its unique number")
+@app_commands.describe(card_number="Unique card number to delete")
 async def deletecard(interaction: discord.Interaction, card_number: str):
     with SessionLocal() as db:
         card = db.query(Card).filter(Card.card_number == card_number.strip()).one_or_none()
@@ -178,7 +190,6 @@ async def deletecard(interaction: discord.Interaction, card_number: str):
         db.delete(card)
         db.commit()
         await interaction.response.send_message(f"Deleted card **{card_number}**.", ephemeral=True)
-
 
 # ------------------------------------------------------------------
 # List cards & review logic
@@ -212,6 +223,7 @@ class ListView(discord.ui.View):
 
 
 @bot.tree.command(description="List cards for a category (alphabetical by question)")
+@app_commands.describe(category="Category name to list")
 async def listcards(interaction: discord.Interaction, category: str):
     with SessionLocal() as db:
         cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
@@ -231,6 +243,7 @@ async def listcards(interaction: discord.Interaction, category: str):
 
 
 @bot.tree.command(description="Review cards from a category with weighted randomness")
+@app_commands.describe(category="Category to review (required)")
 async def reviewcards(interaction: discord.Interaction, category: str):
     user_id = interaction.user.id
     with SessionLocal() as db:
@@ -279,7 +292,6 @@ async def reviewcards(interaction: discord.Interaction, category: str):
         except discord.Forbidden:
             pass
         active_reviews[sent.id] = {"user_id": user_id, "card_id": card.id, "category_id": cat.id}
-
 
 # ------------------------------------------------------------------
 # Reaction handling
@@ -376,7 +388,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         }
         active_reviews.pop(reaction.message.id, None)
 
-
 # ------------------------------------------------------------------
 # Streak commands and recap loop
 # ------------------------------------------------------------------
@@ -454,19 +465,19 @@ async def daily_streak_recap_loop():
             logging.exception("Error during streak recap loop")
             continue
 
-
 # ------------------------------------------------------------------
 # Entry point with visible error logging for Fly
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     if not TOKEN:
         logging.error("DISCORD_TOKEN is missing (set it in Fly secrets).")
-        time.sleep(60)
+        time.sleep(60)  # let logs flush on Fly
         raise SystemExit(1)
     try:
-        bot.loop.create_task(daily_streak_recap_loop())
+        # Background task starts from on_ready via asyncio.create_task(...)
         bot.run(TOKEN)
     except Exception:
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
+
