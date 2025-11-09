@@ -109,7 +109,7 @@ def _fetch_category_names(prefix: str = "", limit: int = 25):
         return [c.name for c in q.order_by(Category.name.asc()).limit(limit).all()]
 
 # -----------------------------------------------------------
-# UI: Review Buttons (with defers to avoid timeout)
+# UI: Review Buttons (defer + edit_original_response)
 # -----------------------------------------------------------
 class ReviewView(discord.ui.View):
     def __init__(self, user_id: int, category_id: int, card_id: int):
@@ -124,9 +124,9 @@ class ReviewView(discord.ui.View):
             await interaction.response.send_message("This isn’t your review session.", ephemeral=True)
             return
 
-        # Acknowledge immediately to avoid "This interaction failed"
+        # Acknowledge immediately to avoid interaction timeout
         try:
-            await interaction.response.defer()  # thinking=False by default for component interactions
+            await interaction.response.defer()
         except discord.InteractionResponded:
             pass  # already acknowledged
 
@@ -170,15 +170,16 @@ class ReviewView(discord.ui.View):
             if score.points >= 100:
                 catname = card.category.name if card.category else "Review"
                 try:
-                    await interaction.followup.edit_message(
-                        message_id=interaction.message.id,
-                        content=f"🎉 <@{self.user_id}> finished **{catname}** with 100 points! "
-                                f"(Streak: {streak.current_streak}🔥)",
+                    await interaction.edit_original_response(
+                        content=(
+                            f"🎉 <@{self.user_id}> finished **{catname}** with 100 points! "
+                            f"(Streak: {streak.current_streak}🔥)"
+                        ),
                         embed=None,
                         view=None,
                     )
                 except Exception:
-                    pass
+                    logging.exception("Failed to post completion")
                 score.points = 0
                 db.commit()
                 return
@@ -204,11 +205,7 @@ class ReviewView(discord.ui.View):
             # update internal state for next click
             self.card_id = next_card.id
             try:
-                await interaction.followup.edit_message(
-                    message_id=interaction.message.id,
-                    embed=embed,
-                    view=self
-                )
+                await interaction.edit_original_response(embed=embed, view=self)
             except Exception:
                 logging.exception("Failed to edit message for next card")
 
@@ -336,7 +333,7 @@ async def reviewcards_category_autocomplete(interaction, current: str):
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 # -----------------------------------------------------------
-# Keep reactions too (optional path) — edits same message
+# Optional: raw reactions path (kept, but buttons are primary)
 # -----------------------------------------------------------
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
