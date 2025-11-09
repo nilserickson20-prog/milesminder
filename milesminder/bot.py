@@ -15,6 +15,7 @@ from .db import SessionLocal, init_db
 from .models import Category, Card, ReviewStat, SessionScore, Streak
 from .utils import (
     get_or_create_category,
+    generate_unique_card_number,
     weighted_choice,
     mark_daily_activity,
     EASTERN,
@@ -75,13 +76,10 @@ async def on_ready():
             try:
                 guild_id = int(str(GUILD_ID_RAW).strip())
                 guild = discord.Object(id=guild_id)
-
-                # ✅ ensure global commands are copied into this guild
                 try:
                     bot.tree.copy_global_to(guild=guild)
                 except Exception:
                     pass
-
                 await bot.tree.sync(guild=guild)
                 logging.info("Slash commands synced to guild %s", guild_id)
             except ValueError:
@@ -117,29 +115,23 @@ async def addcategory(interaction: discord.Interaction, name: str):
         await interaction.response.send_message(f"Created category **{cat.name}**.", ephemeral=True)
 
 
-@bot.tree.command(description="Add a flashcard")
+@bot.tree.command(description="Add a flashcard (auto-generates unique card number)")
 @app_commands.describe(
-    card_number="Unique ID (e.g. CRIM-001)",
     question="Question or definition",
     answer="Answer text",
     category="Optional category name",
 )
 async def addcard(
     interaction: discord.Interaction,
-    card_number: str,
     question: str,
     answer: str,
     category: Optional[str] = None,
 ):
     with SessionLocal() as db:
-        if db.query(Card).filter(Card.card_number == card_number).first():
-            await interaction.response.send_message(
-                f"A card with number `{card_number}` already exists.", ephemeral=True
-            )
-            return
         cat = get_or_create_category(db, category)
+        auto_number = generate_unique_card_number(db, cat.name if cat else None)
         card = Card(
-            card_number=card_number.strip(),
+            card_number=auto_number,
             question=question.strip(),
             answer=answer.strip(),
             category=cat,
@@ -147,8 +139,8 @@ async def addcard(
         db.add(card)
         db.commit()
         await interaction.response.send_message(
-            f"Added card **{card.card_number}** in category "
-            f"**{card.category.name if card.category else 'None'}**.",
+            f"Added card **{card.card_number}** in "
+            f"**{card.category.name if card.category else 'No Category'}**.",
             ephemeral=True,
         )
 
@@ -465,4 +457,3 @@ if __name__ == "__main__":
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
-
