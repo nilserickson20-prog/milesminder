@@ -5,7 +5,7 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 import discord
 from discord import app_commands
@@ -68,9 +68,7 @@ STREAK_RESET_LINES = [
 # Review state: message_id -> {user_id, card_id, category_id}
 # -----------------------------------------------------------------------------
 active_reviews: Dict[int, dict] = {}
-
-# tiny de-dupe to avoid double-fires (message_id, user_id) -> ts
-_last_handle: Dict[Tuple[int, int], float] = {}
+_last_handle: Dict[Tuple[int, int], float] = {}  # tiny de-dupe
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -82,7 +80,7 @@ def _fetch_category_names(prefix: str = "", limit: int = 25):
             q = q.filter(Category.name.ilike(f"{prefix.strip()}%"))
         return [c.name for c in q.order_by(Category.name.asc()).limit(limit).all()]
 
-def _embed(catname: str, card: Card, points: int, streak_val: int) -> discord.Embed:
+def _embed_review(catname: str, card: Card, points: int, streak_val: int) -> discord.Embed:
     e = discord.Embed(
         title=f"Review: {catname}",
         description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
@@ -90,6 +88,14 @@ def _embed(catname: str, card: Card, points: int, streak_val: int) -> discord.Em
     )
     e.set_footer(text=f"Points: {points} — React ✅/❌ or use buttons — Streak: {streak_val} day(s)")
     return e
+
+def _embed_card_display(catname: str, card: Card) -> discord.Embed:
+    # Plain display (NOT a review; no points/streak footer, no buttons)
+    return discord.Embed(
+        title=f"{catname} — Card",
+        description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
+        color=discord.Color.blurple(),
+    )
 
 def _pick_next_card(db, user_id: int, category_id: int) -> Card:
     cards = db.query(Card).filter(Card.category_id == category_id).all()
@@ -101,12 +107,10 @@ def _pick_next_card(db, user_id: int, category_id: int) -> Card:
     return weighted_choice(cards, stats_by_id)
 
 async def _post_next_card(channel: discord.abc.Messageable, user_id: int, category_id: int, points: int, streak_val: int):
-    """Pick next card and send as a NEW message with buttons; return (message, card)."""
     with SessionLocal() as db:
         next_card = _pick_next_card(db, user_id, category_id)
         catname = next_card.category.name if next_card.category else "Cards"
-        embed = _embed(catname, next_card, points, streak_val)
-
+        embed = _embed_review(catname, next_card, points, streak_val)
     view = ReviewView(user_id=user_id, category_id=category_id, card_id=next_card.id)
     new_msg = await channel.send(embed=embed, view=view)
     active_reviews[new_msg.id] = {"user_id": user_id, "card_id": next_card.id, "category_id": category_id}
@@ -121,7 +125,7 @@ async def _score_and_advance(
     card_id: int,
     correct: bool,
 ):
-    """Score this card, check win, then send a NEW message with next card. Disable old view / ignore errors."""
+    from datetime import datetime  # local import to avoid shadowing
     with SessionLocal() as db:
         card = db.query(Card).filter(Card.id == card_id).one_or_none()
         if not card:
@@ -162,7 +166,6 @@ async def _score_and_advance(
         streak = mark_daily_activity(db, user_id)
         db.commit()
 
-        # Win condition
         if score.points >= 100:
             catname = card.category.name if card.category else "Review"
             await channel.send(
@@ -170,7 +173,6 @@ async def _score_and_advance(
             )
             score.points = 0
             db.commit()
-            # Disable old view if present
             if old_message:
                 try:
                     await old_message.edit(view=None)
@@ -178,7 +180,6 @@ async def _score_and_advance(
                     pass
             return
 
-        # Otherwise send the next card
         new_msg, _ = await _post_next_card(
             channel=channel,
             user_id=user_id,
@@ -187,7 +188,6 @@ async def _score_and_advance(
             streak_val=streak.current_streak,
         )
 
-    # Tidy old message (remove its view so we don't accept double clicks)
     if old_message:
         try:
             await old_message.edit(view=None)
@@ -195,11 +195,11 @@ async def _score_and_advance(
             pass
 
 # -----------------------------------------------------------------------------
-# Buttons View
+# Buttons View (Review)
 # -----------------------------------------------------------------------------
 class ReviewView(discord.ui.View):
     def __init__(self, user_id: int, category_id: int, card_id: int):
-        super().__init__(timeout=1200)  # 20 minutes
+        super().__init__(timeout=1200)
         self.user_id = user_id
         self.category_id = category_id
         self.card_id = card_id
@@ -229,6 +229,90 @@ class ReviewView(discord.ui.View):
     @discord.ui.button(label="❌ Incorrect", style=discord.ButtonStyle.danger)
     async def btn_incorrect(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._handle(interaction, False)
+
+# -----------------------------------------------------------------------------
+# ListCards View (dropdown just for opening, NOT a review; no IDs shown in list)
+# -----------------------------------------------------------------------------
+def _chunk(lst: List, size: int) -> List[List]:
+    return [lst[i:i+size] for i in range(0, len(lst), size)]
+
+class ListCardsOpenView(discord.ui.View):
+    """Ephemeral dropdown to open a card (shows Q/A only)."""
+    def __init__(self, user_id: int, category_id: int, questions: List[tuple[int, str]]):
+        super().__init__(timeout=900)
+        self.user_id = user_id
+        self.category_id = category_id
+        self.pages: List[List[tuple[int, str]]] = _chunk(questions, 25) or [[]]
+        self.page_index = 0
+        self._rebuild_select()
+
+    def _rebuild_select(self):
+        for item in list(self.children):
+            self.remove_item(item)
+
+        current_page = self.pages[self.page_index]
+        options = [
+            discord.SelectOption(
+                label=(q[:95] + "…") if len(q) > 100 else q,
+                value=str(cid)
+            )
+            for cid, q in current_page
+        ] or [discord.SelectOption(label="(No cards on this page)", value="none", default=True)]
+
+        select = discord.ui.Select(placeholder="Open a question…", min_values=1, max_values=1, options=options)
+
+        async def select_callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
+                return
+            val = select.values[0]
+            if val == "none":
+                await interaction.response.defer()
+                return
+
+            card_id = int(val)
+            with SessionLocal() as db:
+                card = db.query(Card).filter(Card.id == card_id).one_or_none()
+                if not card:
+                    await interaction.response.send_message("That card was not found.", ephemeral=True)
+                    return
+                catname = card.category.name if card.category else "Cards"
+                embed = _embed_card_display(catname, card)
+
+            # Post the card plainly (NOT a review)
+            await interaction.channel.send(embed=embed)
+            try:
+                await interaction.response.defer()
+            except discord.InteractionResponded:
+                pass
+
+        select.callback = select_callback
+        self.add_item(select)
+
+        if len(self.pages) > 1:
+            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
+
+            async def prev_cb(interaction: discord.Interaction):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
+                    return
+                self.page_index = (self.page_index - 1) % len(self.pages)
+                self._rebuild_select()
+                await interaction.response.edit_message(view=self)
+
+            async def next_cb(interaction: discord.Interaction):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
+                    return
+                self.page_index = (self.page_index + 1) % len(self.pages)
+                self._rebuild_select()
+                await interaction.response.edit_message(view=self)
+
+            prev_btn.callback = prev_cb
+            next_btn.callback = next_cb
+            self.add_item(prev_btn)
+            self.add_item(next_btn)
 
 # -----------------------------------------------------------------------------
 # Events
@@ -263,12 +347,6 @@ async def on_ready():
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """
-    Reaction path:
-      • We DO NOT edit the old message.
-      • We score, then SEND A NEW MESSAGE with the next card + buttons.
-      • We move the session mapping to the new message id.
-    """
     try:
         if payload.user_id == bot.user.id:
             return
@@ -283,7 +361,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if emoji not in ("✅", "❌"):
             return
 
-        # simple de-dupe (same user/message within ~0.8s)
         now = time.time()
         key = (payload.message_id, payload.user_id)
         if _last_handle.get(key, 0) + 0.8 > now:
@@ -296,7 +373,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         category_id = state["category_id"]
         card_id = state["card_id"]
 
-        # We don't need the old message to advance; just disable its view if we can fetch it.
         old_message = None
         try:
             ch = channel
@@ -313,8 +389,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             card_id=card_id,
             correct=correct,
         )
-
-        # Move state will be handled in _post_next_card; also clear old id
         active_reviews.pop(payload.message_id, None)
 
     except Exception:
@@ -353,30 +427,26 @@ async def addcard(
     with SessionLocal() as db:
         cat = get_or_create_category(db, category)
         auto_number = generate_unique_card_number(db, cat.name if cat else None)
-        card = Card(
-            card_number=auto_number,
-            question=question.strip(),
-            answer=answer.strip(),
-            category=cat,
-        )
+        card = Card(card_number=auto_number, question=question.strip(), answer=answer.strip(), category=cat)
     with SessionLocal() as db2:
         db2.add(card)
         db2.commit()
     await interaction.response.send_message(
-        f"Added card **{card.card_number}** in "
-        f"**{card.category.name if card.category else 'No Category'}**.",
+        f"Added card **{card.card_number}** in **{card.category.name if card.category else 'No Category'}**.",
         ephemeral=True,
     )
 
-# ---- AUTOCOMPLETE 1: addcard(category) --------------------------------------
+# ---- AUTOCOMPLETE: addcard(category) ----------------------------------------
 @addcard.autocomplete("category")
 async def addcard_category_autocomplete(interaction: discord.Interaction, current: str):
     names = _fetch_category_names(current)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
-@bot.tree.command(description="List cards for a category")
+@bot.tree.command(description="List cards for a category (alphabetical, no IDs).")
 @app_commands.describe(category="Category to list")
 async def listcards(interaction: discord.Interaction, category: str):
+    """Posts a plain list in-channel (alphabetical, no IDs) + ephemeral dropdown to open any card (not a review)."""
+    user_id = interaction.user.id
     with SessionLocal() as db:
         cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
         if not cat:
@@ -386,8 +456,21 @@ async def listcards(interaction: discord.Interaction, category: str):
         if not cards:
             await interaction.response.send_message("No cards in that category.", ephemeral=True)
             return
-        lines = [f"• **{c.card_number}** — {c.question}" for c in cards[:200]]
-        await interaction.response.send_message(f"**{cat.name}** — {len(cards)} card(s):\n" + "\n".join(lines), ephemeral=True)
+        qpairs = [(c.id, c.question) for c in cards]
+
+    # Public list (no IDs): just the questions, numbered
+    lines = [f"{i+1}. {q}" for i, (_, q) in enumerate(qpairs)]
+    await interaction.response.send_message(f"**{cat.name}** — {len(qpairs)} card(s):\n" + "\n".join(lines))
+
+    # Ephemeral dropdown to open a single card (acts like the “hyperlink” action)
+    view = ListCardsOpenView(user_id=user_id, category_id=cat.id, questions=qpairs)
+    await interaction.followup.send("Select a question to open it:", view=view, ephemeral=True)
+
+# ---- AUTOCOMPLETE: listcards(category) --------------------------------------
+@listcards.autocomplete("category")
+async def listcards_category_autocomplete(interaction: discord.Interaction, current: str):
+    names = _fetch_category_names(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
 
 @bot.tree.command(description="Start a review session (buttons + optional reactions)")
 @app_commands.describe(category="Category to review")
@@ -417,7 +500,7 @@ async def reviewcards(interaction: discord.Interaction, category: str):
         streak = db.query(Streak).filter(Streak.user_id == str(user_id)).one_or_none()
         streak_val = streak.current_streak if streak else 0
 
-        embed = _embed(cat.name, first_card, score.points, streak_val)
+        embed = _embed_review(cat.name, first_card, score.points, streak_val)
 
     await interaction.response.send_message(
         "Review started. Use the buttons **or** react with ✅/❌.",
@@ -426,10 +509,9 @@ async def reviewcards(interaction: discord.Interaction, category: str):
     view = ReviewView(user_id=user_id, category_id=cat.id, card_id=first_card.id)
     sent = await interaction.channel.send(embed=embed, view=view)
 
-    # Do NOT pre-add reactions; user can add them manually.
     active_reviews[sent.id] = {"user_id": user_id, "card_id": first_card.id, "category_id": cat.id}
 
-# ---- AUTOCOMPLETE 2: reviewcards(category) ----------------------------------
+# ---- AUTOCOMPLETE: reviewcards(category) ------------------------------------
 @reviewcards.autocomplete("category")
 async def reviewcards_category_autocomplete(interaction: discord.Interaction, current: str):
     names = _fetch_category_names(current)
