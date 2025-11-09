@@ -68,7 +68,7 @@ STREAK_RESET_LINES = [
 # Review state: message_id -> {user_id, card_id, category_id}
 # -----------------------------------------------------------------------------
 active_reviews: Dict[int, dict] = {}
-_last_handle: Dict[Tuple[int, int], float] = {}  # tiny de-dupe
+_last_handle: Dict[Tuple[int, int], float] = {}  # tiny de-dupe for reactions
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -90,7 +90,6 @@ def _embed_review(catname: str, card: Card, points: int, streak_val: int) -> dis
     return e
 
 def _embed_card_display(catname: str, card: Card) -> discord.Embed:
-    # Plain display (NOT a review; no points/streak footer, no buttons)
     return discord.Embed(
         title=f"{catname} — Card",
         description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
@@ -125,7 +124,6 @@ async def _score_and_advance(
     card_id: int,
     correct: bool,
 ):
-    from datetime import datetime  # local import to avoid shadowing
     with SessionLocal() as db:
         card = db.query(Card).filter(Card.id == card_id).one_or_none()
         if not card:
@@ -231,74 +229,67 @@ class ReviewView(discord.ui.View):
         await self._handle(interaction, False)
 
 # -----------------------------------------------------------------------------
-# ListCards View (dropdown just for opening, NOT a review; no IDs shown in list)
+# ListCards Buttons Paginator (no dropdowns; scalable)
 # -----------------------------------------------------------------------------
 def _chunk(lst: List, size: int) -> List[List]:
     return [lst[i:i+size] for i in range(0, len(lst), size)]
 
-class ListCardsOpenView(discord.ui.View):
-    """Ephemeral dropdown to open a card (shows Q/A only)."""
-    def __init__(self, user_id: int, category_id: int, questions: List[tuple[int, str]]):
+class ListCardsButtonsView(discord.ui.View):
+    """
+    Ephemeral paginator that shows up to 10 question-buttons per page.
+    Clicking a question posts that single card (plain display) to the channel.
+    """
+    PAGE_SIZE = 10  # leave room for nav buttons
+
+    def __init__(self, user_id: int, category_id: int, questions: List[tuple[int, str]], category_name: str):
         super().__init__(timeout=900)
         self.user_id = user_id
         self.category_id = category_id
-        self.pages: List[List[tuple[int, str]]] = _chunk(questions, 25) or [[]]
+        self.category_name = category_name
+        self.pages: List[List[tuple[int, str]]] = _chunk(questions, self.PAGE_SIZE) or [[]]
         self.page_index = 0
-        self._rebuild_select()
+        self._rebuild()
 
-    def _rebuild_select(self):
+    def _rebuild(self):
+        # Clear old items
         for item in list(self.children):
             self.remove_item(item)
 
-        current_page = self.pages[self.page_index]
-        options = [
-            discord.SelectOption(
-                label=(q[:95] + "…") if len(q) > 100 else q,
-                value=str(cid)
-            )
-            for cid, q in current_page
-        ] or [discord.SelectOption(label="(No cards on this page)", value="none", default=True)]
-
-        select = discord.ui.Select(placeholder="Open a question…", min_values=1, max_values=1, options=options)
-
-        async def select_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.user_id:
-                await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
-                return
-            val = select.values[0]
-            if val == "none":
-                await interaction.response.defer()
-                return
-
-            card_id = int(val)
-            with SessionLocal() as db:
-                card = db.query(Card).filter(Card.id == card_id).one_or_none()
-                if not card:
-                    await interaction.response.send_message("That card was not found.", ephemeral=True)
+        # Add question buttons for current page
+        current = self.pages[self.page_index]
+        for cid, q in current:
+            label = (q[:72] + "…") if len(q) > 75 else q  # button label limit
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+            async def _cb(interaction: discord.Interaction, card_id=cid):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
                     return
-                catname = card.category.name if card.category else "Cards"
-                embed = _embed_card_display(catname, card)
+                with SessionLocal() as db:
+                    card = db.query(Card).filter(Card.id == card_id).one_or_none()
+                    if not card:
+                        await interaction.response.send_message("That card was not found.", ephemeral=True)
+                        return
+                    embed = _embed_card_display(self.category_name, card)
+                await interaction.channel.send(embed=embed)
+                try:
+                    await interaction.response.defer()  # keep the pager up
+                except discord.InteractionResponded:
+                    pass
+            btn.callback = _cb
+            self.add_item(btn)
 
-            # Post the card plainly (NOT a review)
-            await interaction.channel.send(embed=embed)
-            try:
-                await interaction.response.defer()
-            except discord.InteractionResponded:
-                pass
-
-        select.callback = select_callback
-        self.add_item(select)
-
+        # Nav row
         if len(self.pages) > 1:
             prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
             next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
+            page_label = discord.ui.Button(label=f"Page {self.page_index+1}/{len(self.pages)}", style=discord.ButtonStyle.secondary, disabled=True)
 
             async def prev_cb(interaction: discord.Interaction):
                 if interaction.user.id != self.user_id:
                     await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
                     return
                 self.page_index = (self.page_index - 1) % len(self.pages)
-                self._rebuild_select()
+                self._rebuild()
                 await interaction.response.edit_message(view=self)
 
             async def next_cb(interaction: discord.Interaction):
@@ -306,12 +297,13 @@ class ListCardsOpenView(discord.ui.View):
                     await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
                     return
                 self.page_index = (self.page_index + 1) % len(self.pages)
-                self._rebuild_select()
+                self._rebuild()
                 await interaction.response.edit_message(view=self)
 
             prev_btn.callback = prev_cb
             next_btn.callback = next_cb
             self.add_item(prev_btn)
+            self.add_item(page_label)
             self.add_item(next_btn)
 
 # -----------------------------------------------------------------------------
@@ -436,16 +428,19 @@ async def addcard(
         ephemeral=True,
     )
 
-# ---- AUTOCOMPLETE: addcard(category) ----------------------------------------
+# ---- AUTOCOMPLETE: addcard(category)
 @addcard.autocomplete("category")
 async def addcard_category_autocomplete(interaction: discord.Interaction, current: str):
     names = _fetch_category_names(current)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
-@bot.tree.command(description="List cards for a category (alphabetical, no IDs).")
+@bot.tree.command(description="List cards for a category (alphabetical; click a button to open a card)")
 @app_commands.describe(category="Category to list")
 async def listcards(interaction: discord.Interaction, category: str):
-    """Posts a plain list in-channel (alphabetical, no IDs) + ephemeral dropdown to open any card (not a review)."""
+    """
+    Posts a public, alphabetised list (no IDs).
+    Provides an ephemeral buttons paginator (<=10 per page); clicking a name posts that card (plain display).
+    """
     user_id = interaction.user.id
     with SessionLocal() as db:
         cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
@@ -457,16 +452,17 @@ async def listcards(interaction: discord.Interaction, category: str):
             await interaction.response.send_message("No cards in that category.", ephemeral=True)
             return
         qpairs = [(c.id, c.question) for c in cards]
+        cat_name = cat.name
 
-    # Public list (no IDs): just the questions, numbered
+    # Public list
     lines = [f"{i+1}. {q}" for i, (_, q) in enumerate(qpairs)]
-    await interaction.response.send_message(f"**{cat.name}** — {len(qpairs)} card(s):\n" + "\n".join(lines))
+    await interaction.response.send_message(f"**{cat_name}** — {len(qpairs)} card(s):\n" + "\n".join(lines[:400]))  # protect super-long messages
 
-    # Ephemeral dropdown to open a single card (acts like the “hyperlink” action)
-    view = ListCardsOpenView(user_id=user_id, category_id=cat.id, questions=qpairs)
-    await interaction.followup.send("Select a question to open it:", view=view, ephemeral=True)
+    # Ephemeral buttons paginator
+    view = ListCardsButtonsView(user_id=user_id, category_id=cat.id, questions=qpairs, category_name=cat_name)
+    await interaction.followup.send("Open a card by pressing its button:", view=view, ephemeral=True)
 
-# ---- AUTOCOMPLETE: listcards(category) --------------------------------------
+# ---- AUTOCOMPLETE: listcards(category)
 @listcards.autocomplete("category")
 async def listcards_category_autocomplete(interaction: discord.Interaction, current: str):
     names = _fetch_category_names(current)
@@ -511,7 +507,7 @@ async def reviewcards(interaction: discord.Interaction, category: str):
 
     active_reviews[sent.id] = {"user_id": user_id, "card_id": first_card.id, "category_id": cat.id}
 
-# ---- AUTOCOMPLETE: reviewcards(category) ------------------------------------
+# ---- AUTOCOMPLETE: reviewcards(category)
 @reviewcards.autocomplete("category")
 async def reviewcards_category_autocomplete(interaction: discord.Interaction, current: str):
     names = _fetch_category_names(current)
