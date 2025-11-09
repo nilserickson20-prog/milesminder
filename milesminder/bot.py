@@ -64,6 +64,7 @@ STREAK_RESET_LINES = [
     "Objection overruled: we resume!",
 ]
 
+# message_id -> {"user_id": int, "card_id": int, "category_id": int}
 active_reviews: Dict[int, dict] = {}
 
 # -----------------------------------------------------------
@@ -106,6 +107,98 @@ def _fetch_category_names(prefix: str = "", limit: int = 25):
         if prefix:
             q = q.filter(Category.name.ilike(f"{prefix.strip()}%"))
         return [c.name for c in q.order_by(Category.name.asc()).limit(limit).all()]
+
+# -----------------------------------------------------------
+# UI: Review Buttons (reliable alternative to reactions)
+# -----------------------------------------------------------
+class ReviewView(discord.ui.View):
+    def __init__(self, user_id: int, category_id: int, card_id: int):
+        super().__init__(timeout=1200)  # 20 minutes
+        self.user_id = user_id
+        self.category_id = category_id
+        self.card_id = card_id
+
+    async def _handle(self, interaction: discord.Interaction, correct: bool):
+        # only the requesting user may answer
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn’t your review session.", ephemeral=True)
+            return
+
+        with SessionLocal() as db:
+            card = db.query(Card).filter(Card.id == self.card_id).one_or_none()
+            if not card:
+                await interaction.response.send_message("That card disappeared.", ephemeral=True)
+                return
+
+            stat = db.query(ReviewStat).filter(
+                ReviewStat.user_id == str(self.user_id),
+                ReviewStat.card_id == card.id
+            ).one_or_none()
+            if not stat:
+                stat = ReviewStat(user_id=str(self.user_id), card_id=card.id)
+                db.add(stat)
+
+            score = db.query(SessionScore).filter(
+                SessionScore.user_id == str(self.user_id),
+                SessionScore.category_id == self.category_id
+            ).one_or_none()
+            if not score:
+                score = SessionScore(user_id=str(self.user_id), category_id=self.category_id, points=0)
+                db.add(score)
+
+            delta = 5 if correct else -5
+            if correct:
+                stat.rights += 1
+            else:
+                stat.wrongs += 1
+
+            stat.last_reviewed_at = datetime.utcnow()
+            score.points += delta
+            streak = mark_daily_activity(db, self.user_id)
+            db.commit()
+
+            # End condition
+            if score.points >= 100:
+                catname = card.category.name if card.category else "Review"
+                await interaction.response.edit_message(
+                    content=f"🎉 <@{self.user_id}> finished **{catname}** with 100 points! "
+                            f"(Streak: {streak.current_streak}🔥)",
+                    embed=None,
+                    view=None,
+                )
+                score.points = 0
+                db.commit()
+                return
+
+            # Pick next card and update the same message (cleaner UX)
+            cards = db.query(Card).filter(Card.category_id == self.category_id).all()
+            stats = db.query(ReviewStat).filter(
+                ReviewStat.user_id == str(self.user_id),
+                ReviewStat.card_id.in_([c.id for c in cards])
+            ).all()
+            stats_by_id = {s.card_id: s for s in stats}
+            next_card = weighted_choice(cards, stats_by_id)
+
+            embed = discord.Embed(
+                title=f"Review: {card.category.name if card.category else 'Cards'}",
+                description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
+                color=discord.Color.green(),
+            )
+            embed.set_footer(
+                text=f"Points: {score.points} — Click Correct/Incorrect — Streak: {streak.current_streak} day(s)"
+            )
+
+            # update internal state for next click
+            self.card_id = next_card.id
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="✅ Correct", style=discord.ButtonStyle.success)
+    async def btn_correct(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle(interaction, True)
+
+    @discord.ui.button(label="❌ Incorrect", style=discord.ButtonStyle.danger)
+    async def btn_incorrect(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle(interaction, False)
 
 # -----------------------------------------------------------
 # Slash Commands
@@ -159,6 +252,21 @@ async def addcard_category_autocomplete(interaction, current: str):
     names = _fetch_category_names(current)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
+@bot.tree.command(description="List cards for a category")
+async def listcards(interaction: discord.Interaction, category: str):
+    with SessionLocal() as db:
+        cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
+        if not cat:
+            await interaction.response.send_message("Category not found.", ephemeral=True)
+            return
+        cards = db.query(Card).filter(Card.category_id == cat.id).order_by(Card.question.asc()).all()
+        if not cards:
+            await interaction.response.send_message("No cards in that category.", ephemeral=True)
+            return
+        # simple inline list (kept from earlier)
+        lines = [f"• **{c.card_number}** — {c.question}" for c in cards[:50]]
+        await interaction.response.send_message(f"**{cat.name}** — {len(cards)} card(s):\n" + "\n".join(lines), ephemeral=True)
+
 @bot.tree.command(description="Review cards from a category")
 async def reviewcards(interaction: discord.Interaction, category: str):
     user_id = interaction.user.id
@@ -198,16 +306,10 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             color=discord.Color.green(),
         )
         embed.set_footer(
-            text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak_val} day(s)"
+            text=f"Points: {score.points} — Click Correct/Incorrect — Streak: {streak_val} day(s)"
         )
-        await interaction.response.send_message(embed=embed, ephemeral=False)
-        sent = await interaction.original_response()
-        try:
-            await sent.add_reaction("✅")
-            await sent.add_reaction("❌")
-        except discord.Forbidden:
-            pass
-        active_reviews[sent.id] = {"user_id": user_id, "card_id": card.id, "category_id": cat.id}
+        view = ReviewView(user_id=user_id, category_id=cat.id, card_id=card.id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
 
 @reviewcards.autocomplete("category")
 async def reviewcards_category_autocomplete(interaction, current: str):
@@ -215,129 +317,103 @@ async def reviewcards_category_autocomplete(interaction, current: str):
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 # -----------------------------------------------------------
-# Reaction handler (robust)
+# (Keep reactions too, as a bonus path)
 # -----------------------------------------------------------
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
-        return
-
-    review_state = active_reviews.get(payload.message_id)
-    if not review_state or review_state["user_id"] != payload.user_id:
-        return
-
-    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(payload.channel_id)
-        except Exception:
-            return
-
     try:
+        if payload.user_id == bot.user.id:
+            return
+        state = active_reviews.get(payload.message_id)
+        if not state or state["user_id"] != payload.user_id:
+            return
+
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
-    except discord.NotFound:
-        active_reviews.pop(payload.message_id, None)
-        return
-    except Exception:
-        return
-
-    emoji = str(payload.emoji)
-
-    with SessionLocal() as db:
-        card = db.query(Card).filter(Card.id == review_state["card_id"]).one_or_none()
-        if not card:
-            active_reviews.pop(payload.message_id, None)
+        emoji = str(payload.emoji)
+        correct = True if emoji == "✅" else False if emoji == "❌" else None
+        if correct is None:
             return
 
-        stat = db.query(ReviewStat).filter(
-            ReviewStat.user_id == str(payload.user_id),
-            ReviewStat.card_id == card.id
-        ).one_or_none()
-        if not stat:
-            stat = ReviewStat(user_id=str(payload.user_id), card_id=card.id)
-            db.add(stat)
+        # Simulate pressing the buttons’ logic by creating a temporary view instance
+        view = ReviewView(user_id=state["user_id"], category_id=state["category_id"], card_id=state["card_id"])
 
-        score = db.query(SessionScore).filter(
-            SessionScore.user_id == str(payload.user_id),
-            SessionScore.category_id == review_state["category_id"]
-        ).one_or_none()
-        if not score:
-            score = SessionScore(user_id=str(payload.user_id),
-                                  category_id=review_state["category_id"],
-                                  points=0)
-            db.add(score)
+        # We need a fake Interaction-like update. Easiest: re-run the DB logic
+        with SessionLocal() as db:
+            card = db.query(Card).filter(Card.id == state["card_id"]).one_or_none()
+            if not card:
+                active_reviews.pop(payload.message_id, None)
+                return
 
-        delta = 0
-        if emoji == "✅":
-            stat.rights += 1
-            delta = 5
-        elif emoji == "❌":
-            stat.wrongs += 1
-            delta = -5
-        else:
-            return
+            stat = db.query(ReviewStat).filter(
+                ReviewStat.user_id == str(payload.user_id),
+                ReviewStat.card_id == card.id
+            ).one_or_none()
+            if not stat:
+                stat = ReviewStat(user_id=str(payload.user_id), card_id=card.id)
+                db.add(stat)
 
-        stat.last_reviewed_at = datetime.utcnow()
-        score.points += delta
-        streak = mark_daily_activity(db, payload.user_id)
-        db.commit()
+            score = db.query(SessionScore).filter(
+                SessionScore.user_id == str(payload.user_id),
+                SessionScore.category_id == state["category_id"]
+            ).one_or_none()
+            if not score:
+                score = SessionScore(user_id=str(payload.user_id), category_id=state["category_id"], points=0)
+                db.add(score)
 
-        try:
-            if message.embeds:
-                embed = message.embeds[0]
-                embed.set_footer(
-                    text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak.current_streak} day(s)"
-                )
-                await message.edit(embed=embed)
-        except Exception:
-            pass
+            delta = 5 if correct else -5
+            if correct:
+                stat.rights += 1
+            else:
+                stat.wrongs += 1
 
-        if score.points >= 100:
-            cat = card.category.name if card.category else "Review"
-            await channel.send(
-                f"🎉 <@{payload.user_id}> finished **{cat}** with 100 points! "
-                f"(Streak: {streak.current_streak}🔥)"
-            )
-            score.points = 0
+            stat.last_reviewed_at = datetime.utcnow()
+            score.points += delta
+            streak = mark_daily_activity(db, payload.user_id)
             db.commit()
-            active_reviews.pop(payload.message_id, None)
-            return
 
-        cards = db.query(Card).filter(Card.category_id == review_state["category_id"]).all()
-        stats = db.query(ReviewStat).filter(
-            ReviewStat.user_id == str(payload.user_id),
-            ReviewStat.card_id.in_([c.id for c in cards])
-        ).all()
-        stats_by_id = {s.card_id: s for s in stats}
-        next_card = weighted_choice(cards, stats_by_id)
+            if score.points >= 100:
+                catname = card.category.name if card.category else "Review"
+                await channel.send(
+                    f"🎉 <@{payload.user_id}> finished **{catname}** with 100 points! "
+                    f"(Streak: {streak.current_streak}🔥)"
+                )
+                score.points = 0
+                db.commit()
+                active_reviews.pop(payload.message_id, None)
+                try:
+                    await message.edit(view=None)
+                except Exception:
+                    pass
+                return
 
-        embed = discord.Embed(
-            title=f"Review: {card.category.name if card.category else 'Cards'}",
-            description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
-            color=discord.Color.green(),
-        )
-        embed.set_footer(
-            text=f"Points: {score.points} — React ✅ if right, ❌ if wrong — Streak: {streak.current_streak} day(s)"
-        )
+            cards = db.query(Card).filter(Card.category_id == state["category_id"]).all()
+            stats = db.query(ReviewStat).filter(
+                ReviewStat.user_id == str(payload.user_id),
+                ReviewStat.card_id.in_([c.id for c in cards])
+            ).all()
+            stats_by_id = {s.card_id: s for s in stats}
+            next_card = weighted_choice(cards, stats_by_id)
 
-        new_msg = await channel.send(embed=embed)
-        try:
-            await new_msg.add_reaction("✅")
-            await new_msg.add_reaction("❌")
-        except discord.Forbidden:
-            pass
+            embed = discord.Embed(
+                title=f"Review: {card.category.name if card.category else 'Cards'}",
+                description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
+                color=discord.Color.green(),
+            )
+            embed.set_footer(
+                text=f"Points: {score.points} — React ✅/❌ or use the buttons — Streak: {streak.current_streak} day(s)"
+            )
+            new_view = ReviewView(user_id=payload.user_id, category_id=state["category_id"], card_id=next_card.id)
+            await message.edit(embed=embed, view=new_view)
 
-        active_reviews[new_msg.id] = {
-            "user_id": payload.user_id,
-            "card_id": next_card.id,
-            "category_id": review_state["category_id"],
-        }
-        active_reviews.pop(payload.message_id, None)
-        try:
-            await message.delete()
-        except Exception:
-            pass
+            # track state on the same message id (we’re editing in place)
+            active_reviews[payload.message_id] = {
+                "user_id": payload.user_id,
+                "card_id": next_card.id,
+                "category_id": state["category_id"],
+            }
+    except Exception:
+        logging.exception("raw_reaction handler error")
 
 # -----------------------------------------------------------
 # Streak commands + recap loop
@@ -425,3 +501,4 @@ if __name__ == "__main__":
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
+
