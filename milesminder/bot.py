@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import time
+import pathlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple, List
 
@@ -74,6 +75,31 @@ _last_handle: Dict[Tuple[int, int], float] = {}
 # Track cards shown in the *current* review session (per user+category)
 # Key = (user_id, category_id) -> set(card_id)
 REVIEW_SESSION_SEEN: Dict[Tuple[int, int], set] = {}
+
+# -----------------------------------------------------------------------------
+# Reward video helper
+# -----------------------------------------------------------------------------
+def _choose_reward_video() -> Optional[str]:
+    """
+    Returns either:
+      - a URL (string) if REWARD_VIDEO_URLS env is set, or
+      - a local file path (string) if assets are present, else None.
+    """
+    # Option A: URLs in env var
+    urls_csv = os.environ.get("REWARD_VIDEO_URLS", "").strip()
+    if urls_csv:
+        urls = [u.strip() for u in urls_csv.split(",") if u.strip()]
+        if urls:
+            return random.choice(urls)
+
+    # Option B: local files baked into image
+    candidates: List[str] = []
+    for pat in ("/app/assets/rewards/*.mp4", "/app/assets/rewards/*.mov", "/app/assets/rewards/*.webm"):
+        candidates.extend([str(p) for p in pathlib.Path("/").glob(pat.lstrip("/"))])
+    if candidates:
+        return random.choice(candidates)
+
+    return None
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -189,8 +215,22 @@ async def _score_and_advance(
 
         if score.points >= 100:
             catname = card.category.name if card.category else "Review"
+
+            # 1) Play reward video if available
+            reward = _choose_reward_video()
+            if reward:
+                try:
+                    if reward.lower().startswith(("http://", "https://")):
+                        await channel.send(reward)
+                    else:
+                        await channel.send(file=discord.File(reward))
+                except Exception:
+                    logging.exception("Failed to send reward video")
+
+            # 2) Show streak text
             await channel.send(
-                f"🎉 <@{user_id}> finished **{catname}** with 100 points! (Streak: {streak.current_streak}🔥)"
+                f"🎉 <@{user_id}> finished **{catname}** with 100 points!\n"
+                f"🔥 **Streak:** {streak.current_streak} day(s)"
             )
             score.points = 0
             db.commit()
