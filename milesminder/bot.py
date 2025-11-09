@@ -4,8 +4,8 @@ import asyncio
 import logging
 import random
 import time
-from datetime import datetime
-from typing import Optional, Dict, List
+from datetime import datetime, timedelta
+from typing import Optional, Dict
 
 import discord
 from discord import app_commands
@@ -20,14 +20,14 @@ from .utils import (
     EASTERN,
 )
 
-# ------------------------------------------------------------------
-# Logging setup
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# Logging
+# -----------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ------------------------------------------------------------------
-# Environment variable parsing
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# Environment
+# -----------------------------------------------------------
 def _env_int(name: str, default: int = 0) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -41,12 +41,12 @@ TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID_RAW = os.environ.get("GUILD_ID")
 STREAK_CHANNEL_ID = _env_int("STREAK_CHANNEL_ID", 0)
 
-# ------------------------------------------------------------------
-# Discord setup
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# Discord client
+# -----------------------------------------------------------
 intents = discord.Intents.default()
-intents.message_content = False
 intents.reactions = True
+intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -64,9 +64,9 @@ STREAK_RESET_LINES = [
 
 active_reviews: Dict[int, dict] = {}
 
-# ------------------------------------------------------------------
-# On ready: initialise DB, sync commands, start background task
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# on_ready (setup + sync + streak task)
+# -----------------------------------------------------------
 @bot.event
 async def on_ready():
     init_db()
@@ -75,6 +75,13 @@ async def on_ready():
             try:
                 guild_id = int(str(GUILD_ID_RAW).strip())
                 guild = discord.Object(id=guild_id)
+
+                # ✅ ensure global commands are copied into this guild
+                try:
+                    bot.tree.copy_global_to(guild=guild)
+                except Exception:
+                    pass
+
                 await bot.tree.sync(guild=guild)
                 logging.info("Slash commands synced to guild %s", guild_id)
             except ValueError:
@@ -87,14 +94,13 @@ async def on_ready():
         logging.exception("Failed to sync commands: %s", e)
     logging.info("Logged in as %s", bot.user)
 
-    # ✅ Start the daily recap loop once (discord.py 2.x safe)
     if not getattr(bot, "_recap_started", False):
         bot._recap_started = True
         asyncio.create_task(daily_streak_recap_loop())
 
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
 # Slash Commands
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
 @bot.tree.command(description="Add a new category")
 @app_commands.describe(name="Category name, e.g. Criminal Law")
 async def addcategory(interaction: discord.Interaction, name: str):
@@ -108,9 +114,7 @@ async def addcategory(interaction: discord.Interaction, name: str):
         cat = Category(name=name.strip())
         db.add(cat)
         db.commit()
-        await interaction.response.send_message(
-            f"Created category **{cat.name}**.", ephemeral=True
-        )
+        await interaction.response.send_message(f"Created category **{cat.name}**.", ephemeral=True)
 
 
 @bot.tree.command(description="Add a flashcard")
@@ -149,13 +153,7 @@ async def addcard(
         )
 
 
-@bot.tree.command(description="Edit a flashcard by its unique number")
-@app_commands.describe(
-    card_number="Unique card number to edit",
-    question="New question (optional)",
-    answer="New answer (optional)",
-    category="New category (optional)",
-)
+@bot.tree.command(description="Edit a flashcard")
 async def editcard(
     interaction: discord.Interaction,
     card_number: str,
@@ -180,7 +178,6 @@ async def editcard(
 
 
 @bot.tree.command(description="Delete a flashcard by its unique number")
-@app_commands.describe(card_number="Unique card number to delete")
 async def deletecard(interaction: discord.Interaction, card_number: str):
     with SessionLocal() as db:
         card = db.query(Card).filter(Card.card_number == card_number.strip()).one_or_none()
@@ -191,9 +188,9 @@ async def deletecard(interaction: discord.Interaction, card_number: str):
         db.commit()
         await interaction.response.send_message(f"Deleted card **{card_number}**.", ephemeral=True)
 
-# ------------------------------------------------------------------
-# List cards & review logic
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# List cards + review system
+# -----------------------------------------------------------
 class CardButton(discord.ui.Button):
     def __init__(self, label: str, card_number: str):
         super().__init__(label=label, style=discord.ButtonStyle.secondary)
@@ -222,8 +219,7 @@ class ListView(discord.ui.View):
             self.add_item(CardButton(label=c.question[:80], card_number=c.card_number))
 
 
-@bot.tree.command(description="List cards for a category (alphabetical by question)")
-@app_commands.describe(category="Category name to list")
+@bot.tree.command(description="List cards for a category")
 async def listcards(interaction: discord.Interaction, category: str):
     with SessionLocal() as db:
         cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
@@ -232,7 +228,7 @@ async def listcards(interaction: discord.Interaction, category: str):
             return
         cards = db.query(Card).filter(Card.category_id == cat.id).order_by(Card.question.asc()).all()
         if not cards:
-            await interaction.response.send_message("No cards in that category yet.", ephemeral=True)
+            await interaction.response.send_message("No cards in that category.", ephemeral=True)
             return
         view = ListView(cards)
         await interaction.response.send_message(
@@ -242,8 +238,7 @@ async def listcards(interaction: discord.Interaction, category: str):
         )
 
 
-@bot.tree.command(description="Review cards from a category with weighted randomness")
-@app_commands.describe(category="Category to review (required)")
+@bot.tree.command(description="Review cards from a category")
 async def reviewcards(interaction: discord.Interaction, category: str):
     user_id = interaction.user.id
     with SessionLocal() as db:
@@ -253,7 +248,7 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             return
         cards = db.query(Card).filter(Card.category_id == cat.id).all()
         if not cards:
-            await interaction.response.send_message("No cards in that category yet.", ephemeral=True)
+            await interaction.response.send_message("No cards in that category.", ephemeral=True)
             return
 
         stats = db.query(ReviewStat).filter(
@@ -293,9 +288,9 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             pass
         active_reviews[sent.id] = {"user_id": user_id, "card_id": card.id, "category_id": cat.id}
 
-# ------------------------------------------------------------------
-# Reaction handling
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# Reaction add (score + next card)
+# -----------------------------------------------------------
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
     if user.bot:
@@ -303,20 +298,17 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
     payload = active_reviews.get(reaction.message.id)
     if not payload or payload["user_id"] != user.id:
         return
-
     emoji = str(reaction.emoji)
     with SessionLocal() as db:
         card = db.query(Card).filter(Card.id == payload["card_id"]).one_or_none()
         if not card:
             return
-
         stat = db.query(ReviewStat).filter(
             ReviewStat.user_id == str(user.id), ReviewStat.card_id == card.id
         ).one_or_none()
         if not stat:
             stat = ReviewStat(user_id=str(user.id), card_id=card.id)
             db.add(stat)
-
         score = db.query(SessionScore).filter(
             SessionScore.user_id == str(user.id),
             SessionScore.category_id == payload["category_id"]
@@ -324,7 +316,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         if not score:
             score = SessionScore(user_id=str(user.id), category_id=payload["category_id"], points=0)
             db.add(score)
-
         delta = 0
         if emoji == "✅":
             stat.rights += 1
@@ -334,12 +325,10 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
             delta = -5
         else:
             return
-
         stat.last_reviewed_at = datetime.utcnow()
         score.points += delta
         streak = mark_daily_activity(db, user.id)
         db.commit()
-
         try:
             embed = reaction.message.embeds[0]
             embed.set_footer(
@@ -348,7 +337,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
             await reaction.message.edit(embed=embed)
         except Exception:
             pass
-
         if score.points >= 100:
             await reaction.message.channel.send(
                 f"🎉 <@{user.id}> finished **{card.category.name if card.category else 'Review'}** "
@@ -358,7 +346,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
             db.commit()
             active_reviews.pop(reaction.message.id, None)
             return
-
         cards = db.query(Card).filter(Card.category_id == payload["category_id"]).all()
         stats = db.query(ReviewStat).filter(
             ReviewStat.user_id == str(user.id),
@@ -366,7 +353,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         ).all()
         stats_by_id = {s.card_id: s for s in stats}
         next_card = weighted_choice(cards, stats_by_id)
-
         embed = discord.Embed(
             title=f"Review: {card.category.name if card.category else 'Cards'}",
             description=f"**Q:** {next_card.question}\n**A:** ||{next_card.answer}||",
@@ -388,23 +374,23 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         }
         active_reviews.pop(reaction.message.id, None)
 
-# ------------------------------------------------------------------
-# Streak commands and recap loop
-# ------------------------------------------------------------------
-@bot.tree.command(description="Show your review streak and longest streak")
+# -----------------------------------------------------------
+# Streak commands
+# -----------------------------------------------------------
+@bot.tree.command(description="Show your current and longest streak")
 async def streak(interaction: discord.Interaction):
     with SessionLocal() as db:
         s = db.query(Streak).filter(Streak.user_id == str(interaction.user.id)).one_or_none()
         if not s:
-            await interaction.response.send_message("No streak yet. Start a /reviewcards to begin!", ephemeral=True)
+            await interaction.response.send_message("No streak yet. Start reviewing to begin!", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"🔥 **Current streak:** {s.current_streak} day(s)\n🏆 **Longest streak:** {s.longest_streak} day(s)",
+            f"🔥 **Current:** {s.current_streak} days\n🏆 **Longest:** {s.longest_streak} days",
             ephemeral=True,
         )
 
 
-@bot.tree.command(description="Show the leaderboard for longest streaks")
+@bot.tree.command(description="Show the longest streak leaderboard")
 async def streakboard(interaction: discord.Interaction):
     with SessionLocal() as db:
         top = db.query(Streak).order_by(Streak.longest_streak.desc()).limit(10).all()
@@ -412,17 +398,18 @@ async def streakboard(interaction: discord.Interaction):
             await interaction.response.send_message("No streaks yet.", ephemeral=True)
             return
         lines = [
-            f"**{i+1}.** <@{s.user_id}> — {s.longest_streak} day(s) (current {s.current_streak})"
+            f"**{i+1}.** <@{s.user_id}> — {s.longest_streak}d (current {s.current_streak})"
             for i, s in enumerate(top)
         ]
         await interaction.response.send_message("\n".join(lines))
 
-
+# -----------------------------------------------------------
+# Daily recap loop
+# -----------------------------------------------------------
 async def sleep_until_next_3am_eastern():
     now_et = datetime.now(EASTERN)
     target = now_et.replace(hour=3, minute=0, second=0, microsecond=0)
     if now_et >= target:
-        from datetime import timedelta
         target += timedelta(days=1)
     await asyncio.sleep((target - now_et).total_seconds())
 
@@ -436,11 +423,10 @@ async def daily_streak_recap_loop():
         await sleep_until_next_3am_eastern()
         try:
             channel = bot.get_channel(STREAK_CHANNEL_ID)
-            if channel is None:
+            if not channel:
                 logging.warning("STREAK_CHANNEL_ID not found in cache.")
                 continue
             with SessionLocal() as db:
-                from datetime import timedelta
                 today = datetime.now(EASTERN).date()
                 yesterday = (today - timedelta(days=1)).isoformat()
                 actives = db.query(Streak).filter(Streak.last_active_date == yesterday).all()
@@ -465,16 +451,15 @@ async def daily_streak_recap_loop():
             logging.exception("Error during streak recap loop")
             continue
 
-# ------------------------------------------------------------------
-# Entry point with visible error logging for Fly
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------
 if __name__ == "__main__":
     if not TOKEN:
         logging.error("DISCORD_TOKEN is missing (set it in Fly secrets).")
-        time.sleep(60)  # let logs flush on Fly
+        time.sleep(60)
         raise SystemExit(1)
     try:
-        # Background task starts from on_ready via asyncio.create_task(...)
         bot.run(TOKEN)
     except Exception:
         logging.exception("Fatal error during startup")
