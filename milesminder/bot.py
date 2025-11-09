@@ -1,4 +1,4 @@
-from __future__ import annotations
+code = r'''from __future__ import annotations
 import os
 import asyncio
 import logging
@@ -65,10 +65,15 @@ STREAK_RESET_LINES = [
 ]
 
 # -----------------------------------------------------------------------------
-# Review state: message_id -> {user_id, card_id, category_id}
+# Review state
 # -----------------------------------------------------------------------------
+# message_id -> {user_id, card_id, category_id}
 active_reviews: Dict[int, dict] = {}
-_last_handle: Dict[Tuple[int, int], float] = {}  # tiny de-dupe for reactions
+# tiny de-dupe for reactions
+_last_handle: Dict[Tuple[int, int], float] = {}
+# Track cards shown in the *current* review session (per user+category)
+# Key = (user_id, category_id) -> set(card_id)
+REVIEW_SESSION_SEEN: Dict[Tuple[int, int], set] = {}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -96,20 +101,38 @@ def _embed_card_display(catname: str, card: Card) -> discord.Embed:
         color=discord.Color.blurple(),
     )
 
-def _pick_next_card(db, user_id: int, category_id: int) -> Card:
-    cards = db.query(Card).filter(Card.category_id == category_id).all()
+def _pick_next_card(db, user_id: int, category_id: int, exclude_ids: Optional[set] = None) -> Optional[Card]:
+    """Choose next card, preferring ones you got wrong more often, while excluding `exclude_ids` if provided.
+       If all cards are excluded, we fall back to the full set (allow repeats after a full pass)."""
+    exclude_ids = exclude_ids or set()
+    all_cards = db.query(Card).filter(Card.category_id == category_id).all()
+    if not all_cards:
+        return None
+
+    candidates = [c for c in all_cards if c.id not in exclude_ids]
+    if not candidates:
+        candidates = all_cards  # allow repeats after all seen once
+
     stats = db.query(ReviewStat).filter(
         ReviewStat.user_id == str(user_id),
-        ReviewStat.card_id.in_([c.id for c in cards])
+        ReviewStat.card_id.in_([c.id for c in candidates])
     ).all()
     stats_by_id = {s.card_id: s for s in stats}
-    return weighted_choice(cards, stats_by_id)
+    return weighted_choice(candidates, stats_by_id)
 
 async def _post_next_card(channel: discord.abc.Messageable, user_id: int, category_id: int, points: int, streak_val: int):
     with SessionLocal() as db:
-        next_card = _pick_next_card(db, user_id, category_id)
+        seen = REVIEW_SESSION_SEEN.get((user_id, category_id), set())
+        next_card = _pick_next_card(db, user_id, category_id, exclude_ids=seen)
+        if next_card is None:
+            await channel.send("No cards available in this category.")
+            return None, None
         catname = next_card.category.name if next_card.category else "Cards"
         embed = _embed_review(catname, next_card, points, streak_val)
+
+    # record as seen
+    REVIEW_SESSION_SEEN.setdefault((user_id, category_id), set()).add(next_card.id)
+
     view = ReviewView(user_id=user_id, category_id=category_id, card_id=next_card.id)
     new_msg = await channel.send(embed=embed, view=view)
     active_reviews[new_msg.id] = {"user_id": user_id, "card_id": next_card.id, "category_id": category_id}
@@ -176,6 +199,8 @@ async def _score_and_advance(
                     await old_message.edit(view=None)
                 except Exception:
                     pass
+            # Reset the session-seen set at the end of a 100-point run
+            REVIEW_SESSION_SEEN.pop((user_id, category_id), None)
             return
 
         new_msg, _ = await _post_next_card(
@@ -193,7 +218,7 @@ async def _score_and_advance(
             pass
 
 # -----------------------------------------------------------------------------
-# Buttons View (Review)
+# Views: Review buttons
 # -----------------------------------------------------------------------------
 class ReviewView(discord.ui.View):
     def __init__(self, user_id: int, category_id: int, card_id: int):
@@ -239,7 +264,6 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
         self.original_message = original_message
         self.category_name = category_name
 
-        # Fill with existing values
         with SessionLocal() as db:
             c = db.query(Card).filter(Card.id == self.card_id).one_or_none()
             q_val = c.question if c else ""
@@ -268,12 +292,10 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
             db.refresh(c)
             catname = c.category.name if c.category else self.category_name
 
-        # Refresh the original embed
         try:
             await self.original_message.edit(embed=_embed_card_display(catname, c), view=CardManageView(self.opener_user_id, self.card_id, catname))
         except Exception:
             pass
-
         await interaction.response.send_message("Saved changes.", ephemeral=True)
 
 class ConfirmDeleteView(discord.ui.View):
@@ -300,7 +322,6 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Restore original view (rebuild from DB if still present)
         with SessionLocal() as db:
             c = db.query(Card).filter(Card.id == self.card_id).one_or_none()
             if not c:
@@ -332,7 +353,6 @@ class CardManageView(discord.ui.View):
         if interaction.user.id != self.opener_user_id:
             await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
             return
-        # Swap view to confirmation
         await interaction.response.edit_message(view=ConfirmDeleteView(self.opener_user_id, self.card_id, self.category_name))
 
 # -----------------------------------------------------------------------------
@@ -563,10 +583,8 @@ async def listcards(interaction: discord.Interaction, category: str):
         cat_name = cat.name
 
     lines = [f"{i+1}. {q}" for i, (_, q) in enumerate(qpairs)]
-    # Protect against super-long messages (Discord 2000 char limit)
     text = f"**{cat_name}** — {len(qpairs)} card(s):\n" + "\n".join(lines)
     if len(text) > 1900:
-        # Trim and hint pagination
         text = text[:1800] + "\n… (truncated; use the pager to open any card)"
     await interaction.response.send_message(text)
 
@@ -603,10 +621,17 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             db.commit()
             db.refresh(score)
 
-        first_card = _pick_next_card(db, user_id, cat.id)
+        # Start a fresh “seen this session” set
+        REVIEW_SESSION_SEEN[(user_id, cat.id)] = set()
+
+        first_card = _pick_next_card(db, user_id, cat.id, exclude_ids=REVIEW_SESSION_SEEN[(user_id, cat.id)])
+        if first_card is None:
+            await interaction.response.send_message("No cards available to review in that category.", ephemeral=True)
+            return
+        REVIEW_SESSION_SEEN[(user_id, cat.id)].add(first_card.id)
+
         streak = db.query(Streak).filter(Streak.user_id == str(user_id)).one_or_none()
         streak_val = streak.current_streak if streak else 0
-
         embed = _embed_review(cat.name, first_card, score.points, streak_val)
 
     await interaction.response.send_message(
@@ -710,3 +735,8 @@ if __name__ == "__main__":
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
+'''
+with open('/mnt/data/bot.py.txt', 'w', encoding='utf-8') as f:
+    f.write(code)
+
+'/mnt/data/bot.py.txt'
