@@ -1,158 +1,66 @@
+
 from __future__ import annotations
 import random
-import re
-from datetime import datetime, date, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, List
+from datetime import datetime
+import pytz
 
-try:
-    # Python 3.9+
-    from zoneinfo import ZoneInfo
-    EASTERN = ZoneInfo("America/New_York")
-except Exception:
-    # Fallback: if zoneinfo isn't available in the image
-    EASTERN = None
+from .models import Category, Subcategory, Card, ReviewStat, Streak
 
-from .models import Category, Card, ReviewStat, SessionScore, Streak
+EASTERN = pytz.timezone("America/New_York")
 
-
-# ---------------------------------------------------------------------------
-# Categories
-# ---------------------------------------------------------------------------
 def get_or_create_category(db, name: Optional[str]) -> Optional[Category]:
-    """Return an existing Category by name (case-insensitive) or create one. None in -> None out."""
-    if not name:
-        return None
-    nm = name.strip()
-    cat = db.query(Category).filter(Category.name.ilike(nm)).one_or_none()
-    if cat:
-        return cat
-    cat = Category(name=nm)
-    db.add(cat)
-    db.commit()
-    db.refresh(cat)
-    return cat
+    if not name: return None
+    name = name.strip()
+    cat = db.query(Category).filter(Category.name.ilike(name)).one_or_none()
+    if cat: return cat
+    cat = Category(name=name); db.add(cat); db.flush(); return cat
 
+def get_or_create_subcategory(db, category: Category, sub_name: Optional[str]) -> Optional[Subcategory]:
+    if not category or not sub_name: return None
+    sub_name = sub_name.strip()
+    sub = db.query(Subcategory).filter(Subcategory.category_id==category.id, Subcategory.name.ilike(sub_name)).one_or_none()
+    if sub: return sub
+    sub = Subcategory(name=sub_name, category_id=category.id); db.add(sub); db.flush(); return sub
 
-# ---------------------------------------------------------------------------
-# Card numbering
-#   Generates a human-friendly unique number per category prefix:
-#   <CAT>-<NNNN>, where CAT is up to 4 alphanum from the category (or 'GEN').
-# ---------------------------------------------------------------------------
-def generate_unique_card_number(db, category_name: Optional[str]) -> str:
-    base = (category_name or "GEN").upper()
-    base = re.sub(r"[^A-Z0-9]+", "", base)[:4] or "GEN"
-    prefix = f"{base}-"
+def generate_unique_card_number(db, scope_hint: Optional[str] = None) -> str:
+    while True:
+        num = f"{random.randint(100000, 999999)}"
+        exists = db.query(Card).filter(Card.card_number == num).first()
+        if not exists: return num
 
-    existing = db.query(Card.card_number).filter(Card.card_number.ilike(f"{prefix}%")).all()
-    max_n = 0
-    for (cn,) in existing:
-        m = re.match(rf"^{re.escape(prefix)}(\d+)$", cn or "")
-        if m:
-            try:
-                max_n = max(max_n, int(m.group(1)))
-            except ValueError:
-                pass
-    next_n = max_n + 1
-    return f"{prefix}{next_n:04d}"
-
-
-# ---------------------------------------------------------------------------
-# Weighted selection for review
-#   Heavier weight if a card has more wrongs, slightly lighter with many rights.
-# ---------------------------------------------------------------------------
-def weighted_choice(cards: list[Card], stats_by_id: Dict[int, ReviewStat]) -> Card:
-    if not cards:
-        raise ValueError("No cards to choose from")
-
+def weighted_choice(candidates: List[Card], stats_by_id: Dict[int, ReviewStat]) -> Card:
     weights = []
-    for c in cards:
+    for c in candidates:
         s = stats_by_id.get(c.id)
-        rights = (s.rights or 0) if s else 0
-        wrongs = (s.wrongs or 0) if s else 0
-
-        # Base 1.0 + 2.0 per wrong - 0.3 per right; floor at 0.2 to keep it selectable
-        w = max(0.2, 1.0 + 2.0 * wrongs - 0.3 * rights)
+        if not s: w = 3.0
+        else:
+            wrongs = s.wrongs or 0; rights = s.rights or 0
+            w = 1.0 + wrongs * 2.0 - rights * 0.2
+            if w < 0.2: w = 0.2
         weights.append(w)
-
-    total = sum(weights)
-    r = random.random() * total
-    upto = 0.0
-    for c, w in zip(cards, weights):
-        if upto + w >= r:
-            return c
+    total = sum(weights); r = random.random() * total; upto = 0.0
+    for cand, w in zip(candidates, weights):
+        if upto + w >= r: return cand
         upto += w
-    return cards[-1]
+    return candidates[-1]
 
-
-# ---------------------------------------------------------------------------
-# Streak tracking
-#   We store last_active_date as ISO string for compatibility with legacy rows.
-#   On read, we parse strings to date objects.
-# ---------------------------------------------------------------------------
-def _today_et() -> date:
-    if EASTERN:
-        return datetime.now(EASTERN).date()
-    # Fallback to UTC date if tz unavailable
-    return datetime.utcnow().date()
-
-def _as_date(d) -> Optional[date]:
-    if d is None:
-        return None
-    if isinstance(d, date):
-        return d
-    if isinstance(d, str):
-        try:
-            return date.fromisoformat(d)
-        except Exception:
-            return None
-    return None
-
-def mark_daily_activity(db, user_id: int | str) -> Streak:
-    """Increment/maintain a user's daily streak; returns the Streak row."""
-    uid = str(user_id)
-    s = db.query(Streak).filter(Streak.user_id == uid).one_or_none()
-    today = _today_et()
-
+def mark_daily_activity(db, user_id: int):
+    today = datetime.now(EASTERN).date()
+    s = db.query(Streak).filter(Streak.user_id == str(user_id)).one_or_none()
     if not s:
-        s = Streak(
-            user_id=uid,
-            current_streak=1,
-            longest_streak=1,
-            last_active_date=today.isoformat(),  # store ISO string
-        )
-        db.add(s)
-        db.commit()
-        db.refresh(s)
-        return s
-
-    last = _as_date(s.last_active_date)
-
-    if last is None:
-        # If legacy/bad data, normalise
-        s.current_streak = max(1, s.current_streak or 0)
-        s.longest_streak = max(s.current_streak, s.longest_streak or 0)
-        s.last_active_date = today.isoformat()
-        db.commit()
-        db.refresh(s)
-        return s
-
-    delta_days = (today - last).days
-
-    if delta_days <= 0:
-        # Already counted today (or future/skew): ensure ISO stored
-        s.last_active_date = today.isoformat()
-    elif delta_days == 1:
-        s.current_streak = (s.current_streak or 0) + 1
-        if s.current_streak > (s.longest_streak or 0):
-            s.longest_streak = s.current_streak
-        s.last_active_date = today.isoformat()
+        s = Streak(user_id=str(user_id), current_streak=1, longest_streak=1, last_active_date=today.isoformat())
+        db.add(s); db.flush(); return s
+    last_iso = s.last_active_date
+    if not last_iso:
+        s.current_streak = 1; s.longest_streak = max(s.longest_streak or 0, s.current_streak)
+        s.last_active_date = today.isoformat(); db.flush(); return s
+    try: from_iso = datetime.fromisoformat(last_iso).date()
+    except Exception: from_iso = today
+    delta = (today - from_iso).days
+    if delta == 0: return s
+    if delta == 1:
+        s.current_streak = (s.current_streak or 0) + 1; s.longest_streak = max(s.longest_streak or 0, s.current_streak)
     else:
-        # Missed >= 1 day
         s.current_streak = 1
-        if s.longest_streak is None:
-            s.longest_streak = 1
-        s.last_active_date = today.isoformat()
-
-    db.commit()
-    db.refresh(s)
-    return s
+    s.last_active_date = today.isoformat(); db.flush(); return s
