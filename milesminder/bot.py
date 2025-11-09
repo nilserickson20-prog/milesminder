@@ -417,14 +417,23 @@ async def addcard(
     category: Optional[str] = None,
 ):
     with SessionLocal() as db:
-        cat = get_or_create_category(db, category)
-        auto_number = generate_unique_card_number(db, cat.name if cat else None)
-        card = Card(card_number=auto_number, question=question.strip(), answer=answer.strip(), category=cat)
-    with SessionLocal() as db2:
-        db2.add(card)
-        db2.commit()
+        cat = get_or_create_category(db, category)  # returns (and commits) the category
+        cat_name = cat.name if cat else "No Category"
+
+        auto_number = generate_unique_card_number(db, cat_name if cat else None)
+        card = Card(
+            card_number=auto_number,
+            question=question.strip(),
+            answer=answer.strip(),
+            category=cat,
+        )
+        db.add(card)
+        db.commit()        # card is persisted
+        db.refresh(card)   # ensure pk/fields populated (not strictly needed for our message)
+
+    # IMPORTANT: Build the message using plain strings captured above, not card.category
     await interaction.response.send_message(
-        f"Added card **{card.card_number}** in **{card.category.name if card.category else 'No Category'}**.",
+        f"Added card **{auto_number}** in **{cat_name}**.",
         ephemeral=True,
     )
 
