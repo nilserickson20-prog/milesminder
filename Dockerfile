@@ -1,21 +1,17 @@
 FROM python:3.11-slim
 
-# set the working directory inside the container
-WORKDIR /app
+# install tzdata so ZoneInfo("America/New_York") works
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
-# make Python behave nicely in containers
+WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# copy dependencies and install them
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy your bot code into the container
 COPY milesminder ./milesminder
 
-# create a folder for the SQLite database
 VOLUME ["/data"]
-
-# start the bot
 CMD ["python", "-m", "milesminder.bot"]
