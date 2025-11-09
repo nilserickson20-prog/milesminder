@@ -109,7 +109,7 @@ def _fetch_category_names(prefix: str = "", limit: int = 25):
         return [c.name for c in q.order_by(Category.name.asc()).limit(limit).all()]
 
 # -----------------------------------------------------------
-# UI: Review Buttons (defer + edit_original_response)
+# UI: Review Buttons (defer + edit the clicked message)
 # -----------------------------------------------------------
 class ReviewView(discord.ui.View):
     def __init__(self, user_id: int, category_id: int, card_id: int):
@@ -118,19 +118,20 @@ class ReviewView(discord.ui.View):
         self.category_id = category_id
         self.card_id = card_id
 
-    async def _handle(self, interaction: discord.Interaction, correct: bool):
+    async def _advance(self, interaction: discord.Interaction, correct: bool):
         # Only the requesting user may answer
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This isn’t your review session.", ephemeral=True)
             return
 
-        # Acknowledge immediately to avoid interaction timeout
+        # Acknowledge immediately
         try:
             await interaction.response.defer()
         except discord.InteractionResponded:
-            pass  # already acknowledged
+            pass
 
         with SessionLocal() as db:
+            # Load current card
             card = db.query(Card).filter(Card.id == self.card_id).one_or_none()
             if not card:
                 try:
@@ -139,6 +140,7 @@ class ReviewView(discord.ui.View):
                     pass
                 return
 
+            # Fetch/Make stat
             stat = db.query(ReviewStat).filter(
                 ReviewStat.user_id == str(self.user_id),
                 ReviewStat.card_id == card.id
@@ -147,6 +149,7 @@ class ReviewView(discord.ui.View):
                 stat = ReviewStat(user_id=str(self.user_id), card_id=card.id)
                 db.add(stat)
 
+            # Fetch/Make score
             score = db.query(SessionScore).filter(
                 SessionScore.user_id == str(self.user_id),
                 SessionScore.category_id == self.category_id
@@ -155,6 +158,7 @@ class ReviewView(discord.ui.View):
                 score = SessionScore(user_id=str(self.user_id), category_id=self.category_id, points=0)
                 db.add(score)
 
+            # Apply result
             delta = 5 if correct else -5
             if correct:
                 stat.rights += 1
@@ -170,7 +174,7 @@ class ReviewView(discord.ui.View):
             if score.points >= 100:
                 catname = card.category.name if card.category else "Review"
                 try:
-                    await interaction.edit_original_response(
+                    await interaction.message.edit(
                         content=(
                             f"🎉 <@{self.user_id}> finished **{catname}** with 100 points! "
                             f"(Streak: {streak.current_streak}🔥)"
@@ -182,9 +186,11 @@ class ReviewView(discord.ui.View):
                     logging.exception("Failed to post completion")
                 score.points = 0
                 db.commit()
+                # clear state
+                active_reviews.pop(interaction.message.id, None)
                 return
 
-            # Pick next card and update the same message (cleaner UX)
+            # Next card
             cards = db.query(Card).filter(Card.category_id == self.category_id).all()
             stats = db.query(ReviewStat).filter(
                 ReviewStat.user_id == str(self.user_id),
@@ -202,20 +208,26 @@ class ReviewView(discord.ui.View):
                 text=f"Points: {score.points} — Click Correct/Incorrect — Streak: {streak.current_streak} day(s)"
             )
 
-            # update internal state for next click
+            # Update our state and the global reaction-state mapping
             self.card_id = next_card.id
+            active_reviews[interaction.message.id] = {
+                "user_id": self.user_id,
+                "card_id": next_card.id,
+                "category_id": self.category_id,
+            }
+
             try:
-                await interaction.edit_original_response(embed=embed, view=self)
+                await interaction.message.edit(embed=embed, view=self)
             except Exception:
                 logging.exception("Failed to edit message for next card")
 
     @discord.ui.button(label="✅ Correct", style=discord.ButtonStyle.success)
     async def btn_correct(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle(interaction, True)
+        await self._advance(interaction, True)
 
     @discord.ui.button(label="❌ Incorrect", style=discord.ButtonStyle.danger)
     async def btn_incorrect(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle(interaction, False)
+        await self._advance(interaction, False)
 
 # -----------------------------------------------------------
 # Slash Commands
@@ -325,7 +337,11 @@ async def reviewcards(interaction: discord.Interaction, category: str):
             text=f"Points: {score.points} — Click Correct/Incorrect — Streak: {streak_val} day(s)"
         )
         view = ReviewView(user_id=user_id, category_id=cat.id, card_id=card.id)
+
         await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+        # Track this message for reaction path as well
+        sent = await interaction.original_response()
+        active_reviews[sent.id] = {"user_id": user_id, "card_id": card.id, "category_id": cat.id}
 
 @reviewcards.autocomplete("category")
 async def reviewcards_category_autocomplete(interaction, current: str):
@@ -333,7 +349,7 @@ async def reviewcards_category_autocomplete(interaction, current: str):
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 # -----------------------------------------------------------
-# Optional: raw reactions path (kept, but buttons are primary)
+# Optional: raw reactions path (works on the same message)
 # -----------------------------------------------------------
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -416,6 +432,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             new_view = ReviewView(user_id=payload.user_id, category_id=state["category_id"], card_id=next_card.id)
             await message.edit(embed=embed, view=new_view)
 
+            # update state (same message id)
             active_reviews[payload.message_id] = {
                 "user_id": payload.user_id,
                 "card_id": next_card.id,
@@ -510,4 +527,3 @@ if __name__ == "__main__":
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
-
