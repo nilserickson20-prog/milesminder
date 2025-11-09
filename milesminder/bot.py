@@ -182,8 +182,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 ReviewStat.card_id == card_id
             ).one_or_none()
             if not stat:
-                stat = ReviewStat(user_id=str(user_id), card_id=card_id)
+                stat = ReviewStat(user_id=str(user_id), card_id=card_id, rights=0, wrongs=0)
                 db.add(stat)
+            else:
+                # make sure existing ones aren’t None
+                stat.rights = stat.rights or 0
+                stat.wrongs = stat.wrongs or 0
 
             # Apply result
             delta = 5 if correct else -5
