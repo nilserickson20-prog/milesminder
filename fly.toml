@@ -1,0 +1,12 @@
+app = "milesminder"            # you can rename this if you used a different app name
+primary_region = "iad"         # change region if you prefer (e.g. ord, dfw, sjc)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/data/milesminder.db"
+
+[[mounts]]
+  source = "milesminder_data"
+  destination = "/data"
