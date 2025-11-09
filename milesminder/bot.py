@@ -735,8 +735,3 @@ if __name__ == "__main__":
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
-'''
-with open('/mnt/data/bot.py.txt', 'w', encoding='utf-8') as f:
-    f.write(code)
-
-'/mnt/data/bot.py.txt'
