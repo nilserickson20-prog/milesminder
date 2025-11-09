@@ -100,13 +100,6 @@ def _pick_next_card(db, user_id: int, category_id: int) -> Card:
     stats_by_id = {s.card_id: s for s in stats}
     return weighted_choice(cards, stats_by_id)
 
-async def _remove_user_reaction(message: discord.Message, emoji: str, user: discord.abc.User | discord.Member):
-    # Best-effort: this works without 'Manage Messages' on many servers; if not, we just ignore.
-    try:
-        await message.remove_reaction(emoji, user)
-    except Exception:
-        pass
-
 # -----------------------------------------------------------------------------
 # Events
 # -----------------------------------------------------------------------------
@@ -140,7 +133,14 @@ async def on_ready():
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """
+    Reaction-only advancement:
+      • We do NOT fetch/edit the old message (avoids Read History/edit perms).
+      • We score then SEND A NEW MESSAGE with the next card.
+      • We move the session mapping to the new message id.
+    """
     try:
+        # ignore bot's own reactions
         if payload.user_id == bot.user.id:
             return
 
@@ -148,13 +148,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not state:
             return
         if state["user_id"] != payload.user_id:
+            # Only the session owner can answer this message
             return
 
         emoji = str(payload.emoji)
         if emoji not in ("✅", "❌"):
             return
 
-        # Get a channel object (no need to fetch the old message)
+        # simple de-dupe (same user/message within ~0.8s)
+        now = time.time()
+        key = (payload.message_id, payload.user_id)
+        if _last_handle.get(key, 0) + 0.8 > now:
+            return
+        _last_handle[key] = now
+
         channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
         correct = (emoji == "✅")
         user_id = payload.user_id
@@ -182,10 +189,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 ReviewStat.card_id == card_id
             ).one_or_none()
             if not stat:
+                # ensure integers at creation
                 stat = ReviewStat(user_id=str(user_id), card_id=card_id, rights=0, wrongs=0)
                 db.add(stat)
             else:
-                # make sure existing ones aren’t None
+                # sanitize legacy rows that may have None
                 stat.rights = stat.rights or 0
                 stat.wrongs = stat.wrongs or 0
 
@@ -213,14 +221,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 return
 
             # Next card (send as a NEW message)
-            cards = db.query(Card).filter(Card.category_id == category_id).all()
-            stats = db.query(ReviewStat).filter(
-                ReviewStat.user_id == str(user_id),
-                ReviewStat.card_id.in_([c.id for c in cards])
-            ).all()
-            stats_by_id = {s.card_id: s for s in stats}
-            next_card = weighted_choice(cards, stats_by_id)
-
+            next_card = _pick_next_card(db, user_id, category_id)
             catname = next_card.category.name if next_card.category else "Cards"
             embed = discord.Embed(
                 title=f"Review: {catname}",
@@ -240,13 +241,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         }
 
         # We intentionally do NOT pre-add reactions.
-        # (If you want faster tapping, you can manually react again.)
+
     except Exception:
         logging.exception("raw_reaction handler error")
 
-
 # -----------------------------------------------------------------------------
-# Slash Commands (no buttons anywhere)
+# Slash Commands (reaction-only workflow; no buttons anywhere)
 # -----------------------------------------------------------------------------
 @bot.tree.command(description="Add a new category")
 @app_commands.describe(name="Category name, e.g. Criminal Law")
@@ -292,12 +292,14 @@ async def addcard(
             ephemeral=True,
         )
 
+# ---- AUTOCOMPLETE 1: addcard(category) --------------------------------------
 @addcard.autocomplete("category")
-async def addcard_category_autocomplete(interaction, current: str):
+async def addcard_category_autocomplete(interaction: discord.Interaction, current: str):
     names = _fetch_category_names(current)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 @bot.tree.command(description="List cards for a category")
+@app_commands.describe(category="Category to list")
 async def listcards(interaction: discord.Interaction, category: str):
     with SessionLocal() as db:
         cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
@@ -312,6 +314,7 @@ async def listcards(interaction: discord.Interaction, category: str):
         await interaction.response.send_message(f"**{cat.name}** — {len(cards)} card(s):\n" + "\n".join(lines), ephemeral=True)
 
 @bot.tree.command(description="Start a reaction-based review session (react with ✅ or ❌)")
+@app_commands.describe(category="Category to review")
 async def reviewcards(interaction: discord.Interaction, category: str):
     user_id = interaction.user.id
     with SessionLocal() as db:
@@ -350,6 +353,12 @@ async def reviewcards(interaction: discord.Interaction, category: str):
     # IMPORTANT: do NOT pre-add reactions (per your request)
     active_reviews[sent.id] = {"user_id": user_id, "card_id": first_card.id, "category_id": cat.id}
 
+# ---- AUTOCOMPLETE 2: reviewcards(category) ----------------------------------
+@reviewcards.autocomplete("category")
+async def reviewcards_category_autocomplete(interaction: discord.Interaction, current: str):
+    names = _fetch_category_names(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
+
 # -----------------------------------------------------------------------------
 # Streak + Recap Loop
 # -----------------------------------------------------------------------------
@@ -379,7 +388,7 @@ async def streakboard(interaction: discord.Interaction):
         await interaction.response.send_message("\n".join(lines))
 
 async def sleep_until_next_3am_eastern():
-    now_et = datetime.now(EASTERN)
+    now_et = datetime.now(EASTERN) if EASTERN else datetime.utcnow()
     target = now_et.replace(hour=3, minute=0, second=0, microsecond=0)
     if now_et >= target:
         target += timedelta(days=1)
@@ -398,7 +407,7 @@ async def daily_streak_recap_loop():
                 logging.warning("STREAK_CHANNEL_ID not found.")
                 continue
             with SessionLocal() as db:
-                today = datetime.now(EASTERN).date()
+                today = (datetime.now(EASTERN) if EASTERN else datetime.utcnow()).date()
                 yesterday = (today - timedelta(days=1)).isoformat()
                 actives = db.query(Streak).filter(Streak.last_active_date == yesterday).all()
                 resets = db.query(Streak).filter(Streak.last_active_date != yesterday).all()
