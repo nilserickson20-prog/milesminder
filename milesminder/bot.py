@@ -27,7 +27,7 @@ from discord import app_commands
 from sqlalchemy import (
     create_engine, Column, Integer, String, ForeignKey, Text, UniqueConstraint, Date
 )
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session, joinedload  # ← joinedload added
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -374,35 +374,111 @@ async def addcard(
     )
 
 
+# ---------- /listcards: improved (defer + eager load + pagination) ----------
+MAX_PER_PAGE = 10
+
+def _short(text: str, n: int = 140) -> str:
+    if not text:
+        return ""
+    text = text.strip().replace("\n", " ")
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+class ListCardsView(discord.ui.View):
+    def __init__(self, items: List[str], title: str, *, timeout: int = 600):
+        super().__init__(timeout=timeout)
+        self.items = items
+        self.page = 0
+        self.title = title
+        self.total_pages = max(1, (len(items) + MAX_PER_PAGE - 1) // MAX_PER_PAGE)
+        # Disable if single page
+        self.prev_btn.disabled = self.total_pages <= 1
+        self.next_btn.disabled = self.total_pages <= 1
+
+    def _slice(self) -> List[str]:
+        start = self.page * MAX_PER_PAGE
+        end = start + MAX_PER_PAGE
+        return self.items[start:end]
+
+    def _embed(self) -> discord.Embed:
+        embed = discord.Embed(title=self.title, colour=discord.Colour.blurple())
+        if not self.items:
+            embed.description = "No cards found."
+            return embed
+        embed.description = "\n".join(self._slice())
+        embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages} • {len(self.items)} cards total")
+        return embed
+
+    async def _send_or_update(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self._embed(), view=self)
+        else:
+            await interaction.followup.send(embed=self._embed(), view=self, ephemeral=True)
+
+    @discord.ui.button(label="⬅ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+        await self._send_or_update(interaction)
+
+    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        await self._send_or_update(interaction)
+
+    async def on_timeout(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+
 @tree.command(name="listcards", description="List cards (optionally filter)", guild=GUILD_FOR_SYNC)
 @app_commands.describe(category="Filter by category", subcategory="Filter by subcategory")
 @app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
 async def listcards(interaction: discord.Interaction, category: Optional[str] = None, subcategory: Optional[str] = None):
-    with db() as sess:
-        cat_id = get_category_id_by_name(sess, category) if category else None
-        sub_id = get_subcategory_id_by_name(sess, cat_id, subcategory) if (subcategory and cat_id) else None
+    # Prevent 3s timeout while DB loads and we build output
+    await interaction.response.defer(ephemeral=True)
 
-        q = sess.query(Card).order_by(Card.question.asc())
-        if cat_id:
-            q = q.filter(Card.category_id == cat_id)
-        if sub_id:
-            q = q.filter(Card.subcategory_id == sub_id)
-        cards = q.all()
+    try:
+        with db() as sess:
+            cat_id = get_category_id_by_name(sess, category) if category else None
+            sub_id = get_subcategory_id_by_name(sess, cat_id, subcategory) if (subcategory and cat_id) else None
 
-    if not cards:
-        await interaction.response.send_message("No cards found for that filter.", ephemeral=True)
-        return
+            q = (
+                sess.query(Card)
+                .options(joinedload(Card.category), joinedload(Card.subcategory))
+                .order_by(Card.card_number.asc())
+            )
+            if cat_id:
+                q = q.filter(Card.category_id == cat_id)
+            if sub_id:
+                q = q.filter(Card.subcategory_id == sub_id)
 
-    lines = []
-    for c in cards[:200]:
-        cat = c.category.name if c.category else "No Category"
-        sub = f" • {c.subcategory.name}" if c.subcategory else ""
-        lines.append(f"• **{c.question}** _(in {cat}{sub})_")
-    more = "" if len(cards) <= 200 else f"\n…and {len(cards) - 200} more."
-    await interaction.response.send_message(
-        f"Found **{len(cards)}** cards.\n\n" + "\n".join(lines) + more,
-        ephemeral=True
-    )
+            rows: List[Card] = q.all()
+
+            if not rows:
+                await interaction.followup.send("No cards found for that filter.", ephemeral=True)
+                return
+
+            # Build lines *inside* the session to avoid lazy-load after close.
+            lines: List[str] = []
+            for c in rows:
+                cat = c.category.name if c.category else "No Category"
+                sub = f" / *{c.subcategory.name}*" if c.subcategory else ""
+                lines.append(f"`{c.card_number}` • **{cat}**{sub} — {_short(c.question)}")
+
+        title = "Cards" if not category else f"Cards in {category}" + (f" / {subcategory}" if subcategory else "")
+        view = ListCardsView(lines, title=title)
+        await view._send_or_update(interaction)
+
+    except Exception as e:
+        log.exception("Error in /listcards")
+        try:
+            await interaction.followup.send(f"⚠️ Error listing cards: `{type(e).__name__}` — {e}", ephemeral=True)
+        except Exception:
+            pass
+# ---------- end /listcards ----------
 
 
 # ------------------------------------------------------------------------------
