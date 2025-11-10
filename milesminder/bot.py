@@ -214,6 +214,18 @@ def fetch_card_dict(sess: Session, card_id: int) -> Dict:
         "subcategory_name": c.subcategory.name if c.subcategory else None,
     }
 
+# ---------- helpers for single-card display (used by clickable list) ----------
+def _embed_card_display(scope_title: str, c: Card) -> discord.Embed:
+    """Pretty single-card embed for edit/delete screen."""
+    cat = c.category.name if c.category else "No Category"
+    sub = f" ▸ {c.subcategory.name}" if c.subcategory else ""
+    title = scope_title or (cat + sub if sub else cat)
+    desc = f"**Q**: {c.question}\n\n**A**: ||{c.answer}||"
+    emb = discord.Embed(title=title, description=desc, colour=discord.Colour.blurple())
+    emb.set_footer(text=f"{cat}{sub} • {c.card_number}")
+    return emb
+# -----------------------------------------------------------------------------
+
 
 def pick_reward_file() -> Optional[str]:
     try:
@@ -374,70 +386,212 @@ async def addcard(
     )
 
 
-# ---------- /listcards: improved (defer + eager load + pagination) ----------
-MAX_PER_PAGE = 10
-
-def _short(text: str, n: int = 140) -> str:
-    if not text:
-        return ""
-    text = text.strip().replace("\n", " ")
-    return text if len(text) <= n else text[: n - 1] + "…"
+# ---------- Button-based /listcards (click a question to open edit/delete) ----------
+def _chunk(lst: List, size: int) -> List[List]:
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
 
 
-class ListCardsView(discord.ui.View):
-    def __init__(self, items: List[str], title: str, *, timeout: int = 600):
-        super().__init__(timeout=timeout)
-        self.items = items
-        self.page = 0
+class EditCardModal(discord.ui.Modal, title="Edit Card"):
+    def __init__(self, opener_user_id: int, card_id: int, original_message: discord.Message, title: str):
+        super().__init__(timeout=300)
+        self.opener_user_id = opener_user_id
+        self.card_id = card_id
+        self.original_message = original_message
+        self.title_text = title
+
+        with db() as sess:
+            c = sess.query(Card).filter(Card.id == self.card_id).one_or_none()
+            q_val = c.question if c else ""
+            a_val = c.answer if c else ""
+
+        self.q = discord.ui.TextInput(
+            label="Question",
+            style=discord.TextStyle.paragraph,
+            default=q_val,
+            required=True,
+            max_length=2000
+        )
+        self.a = discord.ui.TextInput(
+            label="Answer",
+            style=discord.TextStyle.paragraph,
+            default=a_val,
+            required=True,
+            max_length=2000
+        )
+        self.add_item(self.q)
+        self.add_item(self.a)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.opener_user_id:
+            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
+            return
+
+        new_q = str(self.q.value).strip()
+        new_a = str(self.a.value).strip()
+
+        with db() as sess:
+            c = sess.query(Card).filter(Card.id == self.card_id).one_or_none()
+            if not c:
+                await interaction.response.send_message("This card no longer exists.", ephemeral=True)
+                return
+            c.question = new_q
+            c.answer = new_a
+            sess.commit()
+            sess.refresh(c)
+
+        try:
+            await self.original_message.edit(
+                embed=_embed_card_display(self.title_text, c),
+                view=CardManageView(self.opener_user_id, self.card_id, self.title_text)
+            )
+        except Exception:
+            pass
+
+        await interaction.response.send_message("Saved changes.", ephemeral=True)
+
+
+class ConfirmDeleteView(discord.ui.View):
+    def __init__(self, opener_user_id: int, card_id: int):
+        super().__init__(timeout=60)
+        self.opener_user_id = opener_user_id
+        self.card_id = card_id
+
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opener_user_id:
+            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
+            return
+
+        with db() as sess:
+            c = sess.query(Card).filter(Card.id == self.card_id).one_or_none()
+            if not c:
+                await interaction.response.send_message("Already deleted.", ephemeral=True)
+                return
+            sess.delete(c)
+            sess.commit()
+
+        await interaction.message.edit(content="🗑️ Card deleted.", embed=None, view=None)
+        await interaction.response.send_message("Deleted.", ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await interaction.message.edit(view=None)
+
+
+class CardManageView(discord.ui.View):
+    def __init__(self, opener_user_id: int, card_id: int, title: str):
+        super().__init__(timeout=900)
+        self.opener_user_id = opener_user_id
+        self.card_id = card_id
         self.title = title
-        self.total_pages = max(1, (len(items) + MAX_PER_PAGE - 1) // MAX_PER_PAGE)
-        # Disable if single page
-        self.prev_btn.disabled = self.total_pages <= 1
-        self.next_btn.disabled = self.total_pages <= 1
 
-    def _slice(self) -> List[str]:
-        start = self.page * MAX_PER_PAGE
-        end = start + MAX_PER_PAGE
-        return self.items[start:end]
+    @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary)
+    async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opener_user_id:
+            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            EditCardModal(self.opener_user_id, self.card_id, interaction.message, self.title)
+        )
 
-    def _embed(self) -> discord.Embed:
-        embed = discord.Embed(title=self.title, colour=discord.Colour.blurple())
-        if not self.items:
-            embed.description = "No cards found."
-            return embed
-        embed.description = "\n".join(self._slice())
-        embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages} • {len(self.items)} cards total")
-        return embed
+    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger)
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opener_user_id:
+            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=ConfirmDeleteView(self.opener_user_id, self.card_id))
 
-    async def _send_or_update(self, interaction: discord.Interaction):
-        if interaction.response.is_done():
-            await interaction.edit_original_response(embed=self._embed(), view=self)
-        else:
-            await interaction.followup.send(embed=self._embed(), view=self, ephemeral=True)
 
-    @discord.ui.button(label="⬅ Prev", style=discord.ButtonStyle.secondary)
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.page > 0:
-            self.page -= 1
-        await self._send_or_update(interaction)
+class ListCardsButtonsView(discord.ui.View):
+    PAGE_SIZE = 10
 
-    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.secondary)
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.page < self.total_pages - 1:
-            self.page += 1
-        await self._send_or_update(interaction)
+    def __init__(self, user_id: int, pairs: List[tuple[int, str]], title: str):
+        super().__init__(timeout=900)
+        self.user_id = user_id
+        self.title = title
+        self.pages = _chunk(pairs, self.PAGE_SIZE) or [[]]
+        self.page_index = 0
+        self._rebuild()
 
-    async def on_timeout(self):
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
+    def _rebuild(self):
+        # Clear existing
+        for it in list(self.children):
+            self.remove_item(it)
+
+        # Card buttons – label is the question (truncated), no ID shown
+        for cid, q in self.pages[self.page_index]:
+            label = (q[:72] + "…") if len(q) > 75 else q
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+
+            async def _cb(interaction: discord.Interaction, card_id=cid):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
+                    return
+                with db() as sess:
+                    card = (
+                        sess.query(Card)
+                        .options(joinedload(Card.category), joinedload(Card.subcategory))
+                        .filter(Card.id == card_id)
+                        .one_or_none()
+                    )
+                    if not card:
+                        await interaction.response.send_message("That card was not found.", ephemeral=True)
+                        return
+
+                    scope_title = card.category.name if card.category else "Cards"
+                    if card.subcategory and card.category:
+                        scope_title = f"{card.category.name} ▸ {card.subcategory.name}"
+                    embed = _embed_card_display(scope_title, card)
+
+                view = CardManageView(self.user_id, card_id, scope_title)
+                await interaction.channel.send(embed=embed, view=view)
+                try:
+                    await interaction.response.defer()
+                except discord.InteractionResponded:
+                    pass
+
+            btn.callback = _cb
+            self.add_item(btn)
+
+        # Pagination controls
+        if len(self.pages) > 1:
+            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
+            page_label = discord.ui.Button(
+                label=f"Page {self.page_index + 1}/{len(self.pages)}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True
+            )
+
+            async def prev_cb(interaction: discord.Interaction):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
+                    return
+                self.page_index = (self.page_index - 1) % len(self.pages)
+                self._rebuild()
+                await interaction.response.edit_message(view=self)
+
+            async def next_cb(interaction: discord.Interaction):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
+                    return
+                self.page_index = (self.page_index + 1) % len(self.pages)
+                self._rebuild()
+                await interaction.response.edit_message(view=self)
+
+            prev_btn.callback = prev_cb
+            next_btn.callback = next_cb
+            self.add_item(prev_btn)
+            self.add_item(page_label)
+            self.add_item(next_btn)
 
 
 @tree.command(name="listcards", description="List cards (optionally filter)", guild=GUILD_FOR_SYNC)
 @app_commands.describe(category="Filter by category", subcategory="Filter by subcategory")
 @app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
 async def listcards(interaction: discord.Interaction, category: Optional[str] = None, subcategory: Optional[str] = None):
-    # Prevent 3s timeout while DB loads and we build output
+    # Defer to avoid the 3s timeout while querying/building UI
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -457,20 +611,22 @@ async def listcards(interaction: discord.Interaction, category: Optional[str] = 
 
             rows: List[Card] = q.all()
 
-            if not rows:
-                await interaction.followup.send("No cards found for that filter.", ephemeral=True)
-                return
+        if not rows:
+            await interaction.followup.send("No cards found for that filter.", ephemeral=True)
+            return
 
-            # Build lines *inside* the session to avoid lazy-load after close.
-            lines: List[str] = []
-            for c in rows:
-                cat = c.category.name if c.category else "No Category"
-                sub = f" / *{c.subcategory.name}*" if c.subcategory else ""
-                lines.append(f"`{c.card_number}` • **{cat}**{sub} — {_short(c.question)}")
+        # Build pairs (card_id, question). IDs are NOT shown to the user.
+        pairs: List[tuple[int, str]] = [(c.id, c.question) for c in rows]
 
-        title = "Cards" if not category else f"Cards in {category}" + (f" / {subcategory}" if subcategory else "")
-        view = ListCardsView(lines, title=title)
-        await view._send_or_update(interaction)
+        title = "Cards"
+        if category:
+            title = f"{category}"
+            if subcategory:
+                title = f"{category} / {subcategory}"
+
+        view = ListCardsButtonsView(interaction.user.id, pairs, title=title)
+        summary = f"Found **{len(rows)}** cards. Tap a question to open it."
+        await interaction.followup.send(summary, view=view, ephemeral=True)
 
     except Exception as e:
         log.exception("Error in /listcards")
