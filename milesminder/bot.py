@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os, logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -12,7 +13,7 @@ logging.info(_has("DISCORD_GUILD_ID"))
 if not (os.environ.get("DISCORD_TOKEN") and os.environ.get("DISCORD_CLIENT_ID") and os.environ.get("DISCORD_GUILD_ID")):
     print("Missing one of: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID")
     raise SystemExit(1)
-from __future__ import annotations
+
 
 import os
 import sqlite3
