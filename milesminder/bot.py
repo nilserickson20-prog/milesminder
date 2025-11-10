@@ -8,7 +8,7 @@ import random
 import logging
 import datetime as dt
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import discord
 from discord import app_commands
@@ -24,11 +24,11 @@ logging.basicConfig(
 log = logging.getLogger("milesminder")
 
 # ---------------------------
-# Configuration / Env
+# Env / Paths
 # ---------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional (fast sync if set)
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional but recommended for instant slash command availability
 REWARD_DIR = Path(os.getenv("REWARD_VIDEOS_DIR", "./rewards")).resolve()
 DB_PATH = Path(os.getenv("DB_PATH", "./data/milesminder.db")).resolve()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -38,10 +38,10 @@ if not TOKEN:
     raise SystemExit(1)
 
 # ---------------------------
-# Discord client & intents
+# Discord client
 # ---------------------------
 intents = discord.Intents.default()
-intents.message_content = False  # not needed for slash commands
+intents.message_content = False
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------
@@ -56,59 +56,49 @@ def migrate_schema() -> None:
     con = db_connect()
     cur = con.cursor()
 
-    # categories
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS categories (
+    CREATE TABLE IF NOT EXISTS categories(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL
-    )
-    """)
+    )""")
 
-    # subcategories
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS subcategories (
+    CREATE TABLE IF NOT EXISTS subcategories(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       category_id INTEGER NOT NULL,
       UNIQUE(name, category_id),
       FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
-    )
-    """)
+    )""")
 
-    # cards
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS cards (
+    CREATE TABLE IF NOT EXISTS cards(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       card_number TEXT UNIQUE NOT NULL,
       question TEXT NOT NULL,
-      answer TEXT NOT NULL,
+      answer   TEXT NOT NULL,
       category_id INTEGER,
       subcategory_id INTEGER,
       FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL,
       FOREIGN KEY(subcategory_id) REFERENCES subcategories(id) ON DELETE SET NULL
-    )
-    """)
-    # Add missing indexes
+    )""")
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_category_id ON cards(category_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_subcategory_id ON cards(subcategory_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_question ON cards(question)")
 
-    # streaks (rewards awarded per calendar day)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_streaks (
+    CREATE TABLE IF NOT EXISTS user_streaks(
       user_id INTEGER PRIMARY KEY,
-      last_reward_date TEXT, -- YYYY-MM-DD
+      last_reward_date TEXT,
       streak INTEGER NOT NULL DEFAULT 0
-    )
-    """)
+    )""")
 
     con.commit()
     con.close()
 
 def today_str() -> str:
-    tz = os.getenv("TZ")
-    now = dt.datetime.now(dt.timezone.utc).astimezone() if not tz else dt.datetime.now()
-    return now.date().isoformat()
+    return dt.datetime.now().date().isoformat()
 
 def touch_category(name: str) -> int:
     con = db_connect()
@@ -131,7 +121,6 @@ def touch_subcategory(category_id: int, name: str) -> int:
     return sid
 
 def generate_card_number(con: sqlite3.Connection) -> str:
-    # e.g. MM-XXXXX
     cur = con.cursor()
     while True:
         n = f"MM-{random.randint(10000, 99999)}"
@@ -188,15 +177,13 @@ def fetch_card(card_id: int) -> Optional[sqlite3.Row]:
     return row
 
 def upsert_streak_and_maybe_increment(user_id: int) -> int:
-    """Increment streak if user hasn't received a reward today."""
     con = db_connect()
     cur = con.cursor()
     t = today_str()
     cur.execute("SELECT user_id, last_reward_date, streak FROM user_streaks WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     if not row:
-        cur.execute("INSERT INTO user_streaks(user_id, last_reward_date, streak) VALUES (?,?,?)",
-                    (user_id, t, 1))
+        cur.execute("INSERT INTO user_streaks(user_id, last_reward_date, streak) VALUES (?,?,?)", (user_id, t, 1))
         con.commit()
         con.close()
         return 1
@@ -204,8 +191,7 @@ def upsert_streak_and_maybe_increment(user_id: int) -> int:
     streak = row["streak"]
     if last != t:
         streak += 1
-        cur.execute("UPDATE user_streaks SET last_reward_date=?, streak=? WHERE user_id=?",
-                    (t, streak, user_id))
+        cur.execute("UPDATE user_streaks SET last_reward_date=?, streak=? WHERE user_id=?", (t, streak, user_id))
         con.commit()
     con.close()
     return streak
@@ -232,7 +218,7 @@ async def _ac_subcategory(interaction: discord.Interaction, current: str) -> Lis
     return [app_commands.Choice(name=r["name"], value=str(r["id"])) for r in rows]
 
 # ---------------------------
-# UI views
+# UI Views (open/edit/delete + review)
 # ---------------------------
 class CardView(discord.ui.View):
     def __init__(self, card_id: int, can_edit: bool = True, timeout: Optional[float] = 300):
@@ -246,12 +232,10 @@ class EditCardButton(discord.ui.Button):
     def __init__(self, card_id: int):
         super().__init__(style=discord.ButtonStyle.secondary, label="Edit")
         self.card_id = card_id
-
     async def callback(self, interaction: discord.Interaction):
         card = fetch_card(self.card_id)
         if not card:
             return await interaction.response.send_message("Card not found.", ephemeral=True)
-
         modal = EditCardModal(self.card_id, card["question"], card["answer"])
         await interaction.response.send_modal(modal)
 
@@ -259,17 +243,13 @@ class DeleteCardButton(discord.ui.Button):
     def __init__(self, card_id: int):
         super().__init__(style=discord.ButtonStyle.danger, label="Delete")
         self.card_id = card_id
-
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            "Confirm delete?", view=ConfirmDeleteView(self.card_id), ephemeral=True
-        )
+        await interaction.response.send_message("Confirm delete?", view=ConfirmDeleteView(self.card_id), ephemeral=True)
 
 class ConfirmDeleteView(discord.ui.View):
     def __init__(self, card_id: int):
         super().__init__(timeout=30)
         self.card_id = card_id
-
     @discord.ui.button(style=discord.ButtonStyle.danger, label="Yes, delete")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         con = db_connect()
@@ -278,7 +258,6 @@ class ConfirmDeleteView(discord.ui.View):
         con.commit()
         con.close()
         await interaction.response.edit_message(content="Card deleted.", view=None)
-
     @discord.ui.button(style=discord.ButtonStyle.secondary, label="Cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Cancelled.", view=None)
@@ -286,13 +265,11 @@ class ConfirmDeleteView(discord.ui.View):
 class EditCardModal(discord.ui.Modal, title="Edit Card"):
     q = discord.ui.TextInput(label="Question", style=discord.TextStyle.paragraph, max_length=2000)
     a = discord.ui.TextInput(label="Answer", style=discord.TextStyle.paragraph, max_length=4000)
-
     def __init__(self, card_id: int, question: str, answer: str):
         super().__init__(timeout=300)
         self.card_id = card_id
         self.q.default = question
         self.a.default = answer
-
     async def on_submit(self, interaction: discord.Interaction):
         con = db_connect()
         cur = con.cursor()
@@ -301,21 +278,13 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
         con.close()
         await interaction.response.send_message("Card updated.", ephemeral=True)
 
-# Review session per message
 class ReviewView(discord.ui.View):
-    def __init__(
-        self,
-        user_id: int,
-        deck_ids: List[int],
-        target: int,
-        asked: Optional[set[int]] = None,
-        timeout: Optional[float] = 900,
-    ):
+    def __init__(self, user_id: int, deck_ids: List[int], target: int, timeout: Optional[float] = 900):
         super().__init__(timeout=timeout)
         self.user_id = user_id
         self.deck_ids = deck_ids[:]  # pool
-        self.target = target  # 20, 50, or len(deck)
-        self.asked: set[int] = asked or set()
+        self.target = target
+        self.asked: set[int] = set()
         self.current_card_id: Optional[int] = None
 
         self.correct = discord.ui.Button(style=discord.ButtonStyle.success, label="✅ Correct")
@@ -332,93 +301,59 @@ class ReviewView(discord.ui.View):
         return random.choice(remaining)
 
     async def start_or_advance(self, interaction: discord.Interaction):
-        # finish?
         if len(self.asked) >= self.target:
             await self._finish(interaction)
             return
-
         next_id = self._pick_next_id()
         if next_id is None:
             await self._finish(interaction)
             return
-
         self.current_card_id = next_id
         self.asked.add(next_id)
         card = fetch_card(next_id)
         if not card:
             await interaction.response.send_message("Card not found; skipping.", ephemeral=True)
             return
-
-        embed = discord.Embed(
-            title="Question",
-            description=card["question"],
-            color=discord.Color.blurple(),
-        )
+        embed = discord.Embed(title="Question", description=card["question"], color=discord.Color.blurple())
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def _mark_correct(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("This review is not for you.", ephemeral=True)
-        # show answer then move on
         await self._show_answer_then_next(interaction)
 
     async def _mark_wrong(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("This review is not for you.", ephemeral=True)
-        # show answer then move on
         await self._show_answer_then_next(interaction)
 
     async def _show_answer_then_next(self, interaction: discord.Interaction):
         card = fetch_card(self.current_card_id) if self.current_card_id else None
         if not card:
-            await interaction.response.send_message("Missing card.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="Answer",
-            description=card["answer"],
-            color=discord.Color.green(),
-        )
+            return await interaction.response.send_message("Missing card.", ephemeral=True)
+        embed = discord.Embed(title="Answer", description=card["answer"], color=discord.Color.green())
         await interaction.response.edit_message(embed=embed, view=self)
 
-        # Small delay-like UX by deferring and then advancing with a followup edit
-        await interaction.followup.send("Next card coming…", ephemeral=True, wait=True)
-        # Advance
-        # NOTE: for component interactions, you can't call edit on the same response twice in a row;
-        # we re-edit the original message via message reference:
+        # advance using original message edit
         try:
-            # use the original message via interaction.message
-            await self._advance_via_followup(interaction)
+            if len(self.asked) >= self.target:
+                await self._finish(interaction)
+                return
+            next_id = self._pick_next_id()
+            if next_id is None:
+                await self._finish(interaction)
+                return
+            self.current_card_id = next_id
+            self.asked.add(next_id)
+            ncard = fetch_card(next_id)
+            if not ncard:
+                return await interaction.followup.send("Card not found; skipping.", ephemeral=True)
+            nembed = discord.Embed(title="Question", description=ncard["question"], color=discord.Color.blurple())
+            await interaction.message.edit(embed=nembed, view=self)
         except Exception as e:
             log.exception("advance error: %s", e)
 
-    async def _advance_via_followup(self, interaction: discord.Interaction):
-        # Use a fresh token to edit the original message again with next card
-        if len(self.asked) >= self.target:
-            await self._finish(interaction)
-            return
-        next_id = self._pick_next_id()
-        if next_id is None:
-            await self._finish(interaction)
-            return
-
-        self.current_card_id = next_id
-        self.asked.add(next_id)
-        card = fetch_card(next_id)
-        if not card:
-            await interaction.followup.send("Card not found; skipping.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="Question",
-            description=card["question"],
-            color=discord.Color.blurple(),
-        )
-        # edit the original message (interaction.message) with new content
-        await interaction.message.edit(embed=embed, view=self)
-
     async def _finish(self, interaction: discord.Interaction):
-        # Reward (video) then streak line
         files = []
         if REWARD_DIR.exists() and REWARD_DIR.is_dir():
             vids = [p for p in REWARD_DIR.iterdir() if p.suffix.lower() in {".mp4", ".mov", ".webm", ".m4v"}]
@@ -428,18 +363,16 @@ class ReviewView(discord.ui.View):
                     files.append(discord.File(fp=str(chosen), filename=chosen.name))
                 except Exception as e:
                     log.warning("Could not attach reward video: %s", e)
-
         streak = upsert_streak_and_maybe_increment(self.user_id)
         msg = f"✅ Review complete! Streak: **{streak}🔥**"
-
-        if files:
-            await interaction.response.edit_message(content=msg, embed=None, attachments=files, view=None)
-        else:
-            await interaction.response.edit_message(content=msg, embed=None, view=None)
+        await interaction.response.edit_message(content=msg, embed=None, attachments=files or None, view=None)
 
 # ---------------------------
-# Slash Commands
+# Commands
 # ---------------------------
+@bot.tree.command(name="ping", description="Basic liveness check")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong", ephemeral=True)
 
 @bot.tree.command(name="addcategory", description="Create a category.")
 @app_commands.describe(name="Category name")
@@ -543,7 +476,6 @@ async def addcard(
     await interaction.response.send_message(embed=embed, view=CardView(new_id), ephemeral=True)
 
 # ---- List & open cards ----
-
 class ListPageView(discord.ui.View):
     def __init__(self, entries: List[sqlite3.Row], page: int, per_page: int, cat_id: Optional[int], sub_id: Optional[int]):
         super().__init__(timeout=300)
@@ -556,7 +488,6 @@ class ListPageView(discord.ui.View):
         start = page * per_page
         page_slice = entries[start:start + per_page]
 
-        # Add a button per card (Discord max 25 components across rows; we cap per_page)
         for row in page_slice:
             label = row["question"][:80]
             self.add_item(OpenCardButton(row["id"], label))
@@ -571,7 +502,6 @@ class OpenCardButton(discord.ui.Button):
     def __init__(self, card_id: int, label_text: str):
         super().__init__(style=discord.ButtonStyle.primary, label=label_text)
         self.card_id = card_id
-
     async def callback(self, interaction: discord.Interaction):
         card = fetch_card(self.card_id)
         if not card:
@@ -589,7 +519,6 @@ class NavButton(discord.ui.Button):
         self.target_page = target_page
         self.cat_id = cat_id
         self.sub_id = sub_id
-
     async def callback(self, interaction: discord.Interaction):
         entries = fetch_cards(self.cat_id, self.sub_id)
         per_page = 10
@@ -620,10 +549,11 @@ async def listcards(
     await interaction.response.send_message(f"Showing 1-{end} of {len(entries)} cards.", view=view, ephemeral=True)
 
 # ---- Review ----
-
-REVIEW_CHOICES = [app_commands.Choice(name="review_20", value="20"),
-                  app_commands.Choice(name="review_50", value="50"),
-                  app_commands.Choice(name="review_all", value="all")]
+REVIEW_CHOICES = [
+    app_commands.Choice(name="review_20", value="20"),
+    app_commands.Choice(name="review_50", value="50"),
+    app_commands.Choice(name="review_all", value="all")
+]
 
 @bot.tree.command(name="reviewcards", description="Review 20, 50, or all cards. Optional category/subcategory.")
 @app_commands.describe(
@@ -653,43 +583,45 @@ async def reviewcards(
     else:
         target = len(pool)
 
-    # Start session: ensure no repeats within the session
     deck_ids = [row["id"] for row in pool]
     random.shuffle(deck_ids)
 
     view = ReviewView(user_id=interaction.user.id, deck_ids=deck_ids, target=target)
-
-    # send first card container
     await interaction.response.send_message("Review started.", view=view, ephemeral=True)
 
-    # Immediately advance into first question
     try:
         await view.start_or_advance(interaction)
     except discord.errors.InteractionResponded:
-        # If already responded, edit the message we just sent
         msg = await interaction.original_response()
-        fake_interaction = interaction
-        fake_interaction.message = msg  # attach for downstream editing
-        await view._advance_via_followup(fake_interaction)
+        fake = interaction
+        fake.message = msg
+        await view._show_answer_then_next(fake)  # forces first advance path
 
 # ---------------------------
-# Lifecycle / sync
+# Lifecycle / Sync
 # ---------------------------
 @bot.event
 async def setup_hook():
-    # DB migration
     migrate_schema()
 
-    # Command sync
+    # Log pre-sync visibility
+    pre_names = [c.name for c in bot.tree.get_commands()]
+    log.info("Pre-sync local commands: %s", pre_names)
+
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
-        # If commands are global by default, copy to guild for instant availability
-        bot.tree.copy_global_to(guild=guild)
+
+        # Hard reset guild commands, then add every local command to that guild explicitly
+        bot.tree.clear_commands(guild=guild)
+        for cmd in bot.tree.get_commands():  # local definitions
+            bot.tree.add_command(cmd, guild=guild)
+
         synced = await bot.tree.sync(guild=guild)
-        log.info("Synced %d guild commands.", len(synced))
+        log.info("Force-synced %d commands to guild %s: %s",
+                 len(synced), GUILD_ID, [c.name for c in synced])
     else:
         synced = await bot.tree.sync()
-        log.info("Synced %d global commands (may take time to appear).", len(synced))
+        log.info("Synced %d global commands (may take up to an hour to appear).", len(synced))
 
 @bot.event
 async def on_ready():
