@@ -663,16 +663,28 @@ class CategorySelect(discord.ui.Select):
         super().__init__(placeholder="Select Category", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        self.parent_view.selected_category = self.values[0]
+        new_val = self.values[0]
+        # 1) Update stored selection
+        self.parent_view.selected_category = new_val
+
+        # 2) Visually reflect the new selection in THIS dropdown
+        for opt in self.options:
+            opt.default = (opt.value == new_val)
+
+        # 3) Rebuild subcategory options for the newly selected category
         with db() as sess:
             new_sub_opts = _subcategory_options(
                 sess,
-                None if self.parent_view.selected_category == "__none__" else self.parent_view.selected_category
+                None if new_val == "__none__" else new_val
             )
+
+        # 4) Apply the rebuilt subcategory options and set its default to "None"
         self.parent_view.sub_select.options = new_sub_opts
+        self.parent_view.selected_subcategory = "__none__"
         for opt in self.parent_view.sub_select.options:
             opt.default = (opt.value == "__none__")
-        self.parent_view.selected_subcategory = "__none__"
+
+        # 5) Re-render the message so both dropdowns show the new defaults immediately
         await interaction.response.edit_message(view=self.parent_view)
 
 class SubcategorySelect(discord.ui.Select):
@@ -686,8 +698,17 @@ class SubcategorySelect(discord.ui.Select):
         super().__init__(placeholder="Select Subcategory", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        self.parent_view.selected_subcategory = self.values[0]
+        new_val = self.values[0]
+        # 1) Update stored selection
+        self.parent_view.selected_subcategory = new_val
+
+        # 2) Visually reflect the new selection in THIS dropdown
+        for opt in self.options:
+            opt.default = (opt.value == new_val)
+
+        # 3) Re-render so the new default is shown before Save
         await interaction.response.edit_message(view=self.parent_view)
+
 
 class EditCatSubView(discord.ui.View):
     """Dropdown edits of Category/Subcategory + button to open Q/A modal."""
