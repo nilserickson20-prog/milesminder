@@ -9,6 +9,8 @@ WORKDIR /app
 # Copy code first
 COPY milesminder/ milesminder/
 
+COPY assets/ /app/assets/
+
 # Install deps
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
