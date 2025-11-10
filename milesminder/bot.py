@@ -443,6 +443,202 @@ async def addcard(
         f"✅ Added **{number}** to **{loc}**.",
         ephemeral=True,
     )
+# --- Dropdown editing for Category/Subcategory --------------------------------
+def _category_options(sess: Session) -> List[discord.SelectOption]:
+    rows = sess.query(Category.name).order_by(Category.name.asc()).all()
+    opts = [discord.SelectOption(label="None", value="__none__")]
+    for (name,) in rows:
+        opts.append(discord.SelectOption(label=name, value=name))
+    return opts
+
+def _subcategory_options(sess: Session, category_name: Optional[str]) -> List[discord.SelectOption]:
+    opts = [discord.SelectOption(label="None", value="__none__")]
+    if not category_name or category_name == "__none__":
+        return opts
+    cat = sess.query(Category).filter(Category.name.ilike(category_name)).one_or_none()
+    if not cat:
+        return opts
+    rows = (
+        sess.query(Subcategory.name)
+        .filter(Subcategory.category_id == cat.id)
+        .order_by(Subcategory.name.asc())
+        .all()
+    )
+    for (name,) in rows:
+        opts.append(discord.SelectOption(label=name, value=name))
+    return opts
+
+
+class CategorySelect(discord.ui.Select):
+    def __init__(self, parent_view: "EditCatSubView", current_value: Optional[str]):
+        self.parent_view = parent_view
+        with db() as sess:
+            options = _category_options(sess)
+        # default selection
+        default_val = current_value if current_value else "__none__"
+        for opt in options:
+            opt.default = (opt.value == default_val)
+        super().__init__(placeholder="Select Category", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.selected_category = self.values[0]
+        # rebuild subcategory options based on new category
+        with db() as sess:
+            new_sub_opts = _subcategory_options(sess, None if self.parent_view.selected_category == "__none__" else self.parent_view.selected_category)
+        self.parent_view.sub_select.options = new_sub_opts
+        # Reset sub selection to "None" by default on category change
+        for opt in self.parent_view.sub_select.options:
+            opt.default = (opt.value == "__none__")
+        self.parent_view.selected_subcategory = "__none__"
+        await interaction.response.edit_message(view=self.parent_view)
+
+
+class SubcategorySelect(discord.ui.Select):
+    def __init__(self, parent_view: "EditCatSubView", current_cat: Optional[str], current_sub: Optional[str]):
+        self.parent_view = parent_view
+        with db() as sess:
+            options = _subcategory_options(sess, current_cat)
+        default_val = current_sub if (current_sub and current_sub.strip()) else "__none__"
+        for opt in options:
+            opt.default = (opt.value == default_val)
+        super().__init__(placeholder="Select Subcategory", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.selected_subcategory = self.values[0]
+        await interaction.response.edit_message(view=self.parent_view)
+
+
+class EditCatSubView(discord.ui.View):
+    """View allowing dropdown edits of Category/Subcategory plus link to Q/A modal."""
+    def __init__(self, opener_user_id: int, card_id: int, original_message: discord.Message, title: str):
+        super().__init__(timeout=600)
+        self.opener_user_id = opener_user_id
+        self.card_id = card_id
+        self.original_message = original_message
+        self.title_text = title
+
+        # Load current values
+        with db() as sess:
+            c = (
+                sess.query(Card)
+                .options(joinedload(Card.category), joinedload(Card.subcategory))
+                .filter(Card.id == card_id)
+                .one_or_none()
+            )
+        cur_cat = c.category.name if (c and c.category) else None
+        cur_sub = c.subcategory.name if (c and c.subcategory) else None
+
+        self.selected_category = cur_cat if cur_cat else "__none__"
+        self.selected_subcategory = cur_sub if cur_sub else "__none__"
+
+        # Build selects
+        self.cat_select = CategorySelect(self, cur_cat)
+        self.sub_select = SubcategorySelect(self, cur_cat, cur_sub)
+        self.add_item(self.cat_select)
+        self.add_item(self.sub_select)
+
+        # Action buttons
+        self.add_item(discord.ui.Button(label="Open Q/A Modal", style=discord.ButtonStyle.primary, custom_id="open_qa"))
+        self.add_item(discord.ui.Button(label="Save Category/Subcategory", style=discord.ButtonStyle.success, custom_id="save_cat_sub"))
+        self.add_item(discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="cancel_edit"))
+
+    @discord.ui.button(label="dummy", style=discord.ButtonStyle.secondary)
+    async def _hidden_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # not used (placeholder to satisfy decorator); we won't render it
+        pass
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.opener_user_id:
+            await interaction.response.send_message("This editor belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) or isinstance(child, discord.ui.Select):
+                child.disabled = True
+
+    async def handle_component(self, interaction: discord.Interaction):
+        # Route by custom_id of our action buttons
+        cid = None
+        try:
+            cid = interaction.data.get("custom_id")
+        except Exception:
+            pass
+
+        if cid == "open_qa":
+            # Open existing Q/A modal so user can edit text fields
+            await interaction.response.send_modal(
+                EditCardModal(self.opener_user_id, self.card_id, self.original_message, self.title_text)
+            )
+            return
+
+        if cid == "save_cat_sub":
+            # Persist category/subcategory
+            cat_val = None if self.selected_category in (None, "__none__") else self.selected_category
+            sub_val = None if self.selected_subcategory in (None, "__none__") else self.selected_subcategory
+
+            with db() as sess:
+                card = (
+                    sess.query(Card)
+                    .options(joinedload(Card.category), joinedload(Card.subcategory))
+                    .filter(Card.id == self.card_id)
+                    .one_or_none()
+                )
+                if not card:
+                    await interaction.response.send_message("This card no longer exists.", ephemeral=True)
+                    return
+
+                if not cat_val:
+                    card.category_id = None
+                    card.subcategory_id = None
+                else:
+                    cat_obj = sess.query(Category).filter(Category.name.ilike(cat_val)).one_or_none()
+                    if not cat_obj:
+                        await interaction.response.send_message("Selected category no longer exists.", ephemeral=True)
+                        return
+                    card.category_id = cat_obj.id
+
+                    if sub_val:
+                        sub_obj = (
+                            sess.query(Subcategory)
+                            .filter(Subcategory.category_id == cat_obj.id, Subcategory.name.ilike(sub_val))
+                            .one_or_none()
+                        )
+                        if not sub_obj:
+                            await interaction.response.send_message("Selected subcategory no longer exists.", ephemeral=True)
+                            return
+                        card.subcategory_id = sub_obj.id
+                    else:
+                        card.subcategory_id = None
+
+                sess.commit()
+                sess.refresh(card)
+
+            # Update the displayed card embed + restore the manage view
+            try:
+                scope_title = card.category.name if card.category else "Cards"
+                if card.category and card.subcategory:
+                    scope_title = f"{card.category.name} ▸ {card.subcategory.name}"
+                await self.original_message.edit(
+                    embed=_embed_card_display(scope_title, card),
+                    view=CardManageView(self.opener_user_id, self.card_id, scope_title),
+                )
+                await interaction.response.send_message("Saved.", ephemeral=True)
+            except Exception:
+                try:
+                    await interaction.response.send_message("Saved (couldn’t refresh message).", ephemeral=True)
+                except Exception:
+                    pass
+            return
+
+        if cid == "cancel_edit":
+            await interaction.response.defer()
+            try:
+                await self.original_message.edit(view=CardManageView(self.opener_user_id, self.card_id, self.title_text))
+            except Exception:
+                pass
+            return
 
 # ---------- Button-based /listcards helpers (must be above the command) ----------
 def _chunk(lst: List, size: int) -> List[List]:
@@ -465,39 +661,119 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
         self.original_message = original_message
         self.title_text = title
 
+        # Pull current values (including cat/sub names for defaults)
         with db() as sess:
-            c = sess.query(Card).filter(Card.id == self.card_id).one_or_none()
+            c = (
+                sess.query(Card)
+                .options(joinedload(Card.category), joinedload(Card.subcategory))
+                .filter(Card.id == self.card_id)
+                .one_or_none()
+            )
             q_val = c.question if c else ""
             a_val = c.answer if c else ""
+            cat_val = c.category.name if c and c.category else ""
+            sub_val = c.subcategory.name if c and c.subcategory else ""
 
-        self.q = discord.ui.TextInput(label="Question", style=discord.TextStyle.paragraph, default=q_val, required=True, max_length=2000)
-        self.a = discord.ui.TextInput(label="Answer", style=discord.TextStyle.paragraph, default=a_val, required=True, max_length=2000)
+        # Text inputs (pre-filled)
+        self.q = discord.ui.TextInput(
+            label="Question",
+            style=discord.TextStyle.paragraph,
+            default=q_val,
+            required=True,
+            max_length=2000,
+        )
+        self.a = discord.ui.TextInput(
+            label="Answer",
+            style=discord.TextStyle.paragraph,
+            default=a_val,
+            required=True,
+            max_length=2000,
+        )
+        self.cat = discord.ui.TextInput(
+            label="Category (leave blank for none)",
+            style=discord.TextStyle.short,
+            default=cat_val,
+            required=False,
+            max_length=128,
+        )
+        self.sub = discord.ui.TextInput(
+            label="Subcategory (requires Category; leave blank for none)",
+            style=discord.TextStyle.short,
+            default=sub_val,
+            required=False,
+            max_length=128,
+        )
+
+        # Order in modal
         self.add_item(self.q)
         self.add_item(self.a)
+        self.add_item(self.cat)
+        self.add_item(self.sub)
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.opener_user_id:
             await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
             return
+
         new_q = str(self.q.value).strip()
         new_a = str(self.a.value).strip()
+        new_cat = str(self.cat.value).strip()
+        new_sub = str(self.sub.value).strip()
+
+        # Guard: subcategory provided but no category
+        if new_sub and not new_cat:
+            await interaction.response.send_message(
+                "Please provide a Category if you set a Subcategory.",
+                ephemeral=True
+            )
+            return
+
         with db() as sess:
-            c = sess.query(Card).filter(Card.id == self.card_id).one_or_none()
+            c = (
+                sess.query(Card)
+                .options(joinedload(Card.category), joinedload(Card.subcategory))
+                .filter(Card.id == self.card_id)
+                .one_or_none()
+            )
             if not c:
                 await interaction.response.send_message("This card no longer exists.", ephemeral=True)
                 return
+
+            # Update Q/A
             c.question = new_q
             c.answer = new_a
+
+            # Update Category/Subcategory
+            if not new_cat:
+                # Clear both if category blank
+                c.category_id = None
+                c.subcategory_id = None
+            else:
+                cat_obj = ensure_category(sess, new_cat)
+                c.category_id = cat_obj.id
+                if new_sub:
+                    sub_obj = ensure_subcategory(sess, cat_obj, new_sub)
+                    c.subcategory_id = sub_obj.id
+                else:
+                    c.subcategory_id = None
+
             sess.commit()
             sess.refresh(c)
+
+        # Refresh the card display message (title reflects current scope)
         try:
+            scope_title = c.category.name if c.category else "Cards"
+            if c.category and c.subcategory:
+                scope_title = f"{c.category.name} ▸ {c.subcategory.name}"
             await self.original_message.edit(
-                embed=_embed_card_display(self.title_text, c),
-                view=CardManageView(self.opener_user_id, self.card_id, self.title_text)
+                embed=_embed_card_display(scope_title, c),
+                view=CardManageView(self.opener_user_id, self.card_id, scope_title),
             )
         except Exception:
             pass
+
         await interaction.response.send_message("Saved changes.", ephemeral=True)
+
 
 class ConfirmDeleteView(discord.ui.View):
     def __init__(self, opener_user_id: int, card_id: int):
@@ -537,7 +813,14 @@ class CardManageView(discord.ui.View):
         if interaction.user.id != self.opener_user_id:
             await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
             return
-        await interaction.response.send_modal(EditCardModal(self.opener_user_id, self.card_id, interaction.message, self.title))
+
+    # Show the dropdown view (with current values preselected)
+        view = EditCatSubView(self.opener_user_id, self.card_id, interaction.message, self.title)
+    # Reuse the same message to keep things tidy
+        try:
+            await interaction.response.edit_message(view=view)
+        except discord.InteractionResponded:
+            await interaction.message.edit(view=view)
 
     @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger)
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
