@@ -602,8 +602,7 @@ async def listcards(interaction: discord.Interaction, category: Optional[str] = 
             q = (
                 sess.query(Card)
                 .options(joinedload(Card.category), joinedload(Card.subcategory))
-            -   .order_by(Card.card_number.asc())
-            +   .order_by(func.lower(Card.question).asc())
+                .order_by(Card.card_number.asc())
             )
             if cat_id:
                 q = q.filter(Card.category_id == cat_id)
