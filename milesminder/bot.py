@@ -1,4 +1,56 @@
 from __future__ import annotations
+# bot_minimal_check.py (put this at the very top of your bot file or in a tiny test file)
+
+import os, logging
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
+
+intents = discord.Intents.default()
+intents.guilds = True
+
+class MilesBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # Register commands BEFORE syncing
+        # (If you keep commands as functions decorated with @bot.tree.command,
+        # they must be defined before this runs.)
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            synced = await self.tree.sync(guild=guild)
+            logging.info(f"setup_hook synced {len(synced)} guild commands")
+        else:
+            synced = await self.tree.sync()
+            logging.info(f"setup_hook synced {len(synced)} global commands")
+
+bot = MilesBot()
+
+@bot.event
+async def on_ready():
+    logging.info(f"Logged in as {bot.user} ({bot.user.id})")
+
+# --- Define at least one test slash command on THIS bot instance ---
+@bot.tree.command(name="ping", description="Test that slash registration works")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong", ephemeral=True)
+
+# Example of how your real commands should look:
+# @bot.tree.command(name="addcard", description="Add a card")
+# async def addcard(interaction: discord.Interaction, ...):
+#     ...
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        raise SystemExit("DISCORD_TOKEN missing")
+    bot.run(DISCORD_TOKEN)
+
 import os, logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
