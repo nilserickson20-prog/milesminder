@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -15,12 +14,11 @@ from discord import app_commands
 from discord.ext import commands
 
 from .db import init_db, get_session
-from .models import Category, Subcategory, Card, ReviewStat, SessionScore, Streak
+from .models import Category, Subcategory, Card, ReviewStat, Streak
 from .utils import (
     get_or_create_category,
     get_or_create_subcategory,
     generate_unique_card_number,
-    weighted_choice,
     mark_daily_activity,
     EASTERN,
 )
@@ -33,7 +31,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = int(os.environ.get("GUILD_ID", "0"))
 MY_GUILD = discord.Object(id=GUILD_ID) if GUILD_ID else None
-STREAK_CHANNEL_ID = int(os.environ.get("STREAK_CHANNEL_ID", "0"))  # optional
 REWARD_VIDS = os.environ.get("REWARD_VIDEO_URLS", "")  # optional, comma-separated URLs
 
 # ---------------------------------------------------------------------------
@@ -43,22 +40,21 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
 intents.reactions = True
-# message_content not required for slash commands / interactions
-intents.message_content = False
+intents.message_content = False  # not needed for slash commands
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-# message_id -> info about the active review message
-active_reviews: Dict[int, dict] = {}
+# Active review messages: message_id -> session_key
+active_reviews: Dict[int, Tuple[int, Optional[int], Optional[int]]] = {}
 
-# (message_id, user_id) -> last ts handled (debounce for reactions)
+# Review sessions: (user_id, category_id, subcategory_id) -> {pool:set[int], target:int, completed:int, last:int|None}
+REVIEW_SESSIONS: Dict[Tuple[int, Optional[int], Optional[int]], dict] = {}
+
+# Debounce raw reactions: (message_id, user_id) -> last_ts
 _last_handle: Dict[Tuple[int, int], float] = {}
-
-# (user_id, category_id, subcategory_id) -> set(card_id) seen in current session
-REVIEW_SESSION_SEEN: Dict[Tuple[int, Optional[int], Optional[int]], set] = {}
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -76,8 +72,8 @@ def _choose_reward_video() -> Optional[str]:
 
     # fallback to filesystem bundle
     candidates: List[str] = []
-    for pat in ("/app/assets/rewards/*.mp4", "/app/assets/rewards/*.mov", "/app/assets/rewards/*.webm"):
-        candidates.extend([str(p) for p in pathlib.Path("/").glob(pat.lstrip("/"))])
+    for ext in ("mp4", "mov", "webm"):
+        candidates.extend([str(p) for p in pathlib.Path("/app/assets/rewards").glob(f"*.{ext}")])
     if candidates:
         return random.choice(candidates)
     return None
@@ -101,45 +97,22 @@ def _subcategory_names(prefix: str = "", limit: int = 25) -> List[str]:
         return [f"{s.category.name} ▸ {s.name}" for s in subs]
 
 
-def _candidate_cards(db, scope: str, category_id: Optional[int], subcategory_id: Optional[int]) -> List[Card]:
+def _candidate_cards(db, category_id: Optional[int], subcategory_id: Optional[int]) -> List[Card]:
     q = db.query(Card)
-    if scope == "all":
-        return q.all()
-    if scope == "category" and category_id:
-        return q.filter(Card.category_id == category_id).all()
-    if scope == "subcategory" and subcategory_id:
-        return q.filter(Card.subcategory_id == subcategory_id).all()
-    return []
+    if subcategory_id:
+        q = q.filter(Card.subcategory_id == subcategory_id)
+    elif category_id:
+        q = q.filter(Card.category_id == category_id)
+    return q.all()
 
 
-def _pick_next_card(
-    db,
-    user_id: int,
-    scope: str,
-    category_id: Optional[int],
-    subcategory_id: Optional[int],
-    exclude_ids: Optional[set] = None
-) -> Optional[Card]:
-    exclude_ids = exclude_ids or set()
-    all_cards = _candidate_cards(db, scope, category_id, subcategory_id)
-    if not all_cards:
-        return None
-    candidates = [c for c in all_cards if c.id not in exclude_ids] or all_cards
-    stats = db.query(ReviewStat).filter(
-        ReviewStat.user_id == str(user_id),
-        ReviewStat.card_id.in_([c.id for c in candidates])
-    ).all()
-    stats_by_id = {s.card_id: s for s in stats}
-    return weighted_choice(candidates, stats_by_id)
-
-
-def _embed_review(title: str, card: Card, points: int, streak_val: int) -> discord.Embed:
+def _embed_review(title: str, card: Card, remaining: int, completed: int, target: int) -> discord.Embed:
     e = discord.Embed(
         title=title,
         description=f"**Q:** {card.question}\n**A:** ||{card.answer}||",
         color=discord.Color.green(),
     )
-    e.set_footer(text=f"Points: {points} — React ✅/❌ or use the buttons — Streak: {streak_val} day(s)")
+    e.set_footer(text=f"Completed: {completed}/{target} — Remaining: {remaining}")
     return e
 
 
@@ -151,157 +124,153 @@ def _embed_card_display(title: str, card: Card) -> discord.Embed:
     )
 
 
+def _session_key(user_id: int, category_id: Optional[int], subcategory_id: Optional[int]) -> Tuple[int, Optional[int], Optional[int]]:
+    return (user_id, category_id, subcategory_id)
+
+
+def _prepare_pool(card_ids: List[int], mode: str) -> Tuple[set, int]:
+    """Return (pool, target) where pool is a set of ids to be answered correctly once."""
+    if mode == "20":
+        sample = random.sample(card_ids, k=min(20, len(card_ids)))
+    elif mode == "50":
+        sample = random.sample(card_ids, k=min(50, len(card_ids)))
+    else:  # "all"
+        sample = card_ids[:]
+    pool = set(sample)
+    target = len(pool)
+    return pool, target
+
+
+def _pick_from_pool(pool: set, last: Optional[int]) -> Optional[int]:
+    if not pool:
+        return None
+    if len(pool) == 1:
+        return next(iter(pool))
+    # avoid repeating the last card if possible
+    candidates = list(pool)
+    if last in candidates:
+        candidates = [c for c in candidates if c != last] or list(pool)
+    return random.choice(candidates)
+
+
 async def _post_next_card(
     channel: discord.abc.MessageableChannel,
     user_id: int,
-    scope: str,
     category_id: Optional[int],
     subcategory_id: Optional[int],
-    points: int,
-    streak_val: int,
 ):
+    key = _session_key(user_id, category_id, subcategory_id)
+    sess = REVIEW_SESSIONS.get(key)
+    if not sess or not sess["pool"]:
+        await channel.send("No more cards remaining in this session.")
+        return None, None
+
+    next_id = _pick_from_pool(sess["pool"], sess.get("last"))
+    if next_id is None:
+        await channel.send("No more cards remaining in this session.")
+        return None, None
+
     with get_session() as db:
-        seen = REVIEW_SESSION_SEEN.get((user_id, category_id, subcategory_id), set())
-        next_card = _pick_next_card(db, user_id, scope, category_id, subcategory_id, exclude_ids=seen)
-        if next_card is None:
-            await channel.send("No cards available for this selection.")
-            return None, None
+        card = db.query(Card).filter(Card.id == next_id).one_or_none()
+        if not card:
+            # remove missing card from pool
+            sess["pool"].discard(next_id)
+            return await _post_next_card(channel, user_id, category_id, subcategory_id)
 
         title = "Review: All Categories"
-        if scope == "category" and next_card.category:
-            title = f"Review: {next_card.category.name}"
-        if scope == "subcategory" and next_card.subcategory and next_card.category:
-            title = f"Review: {next_card.category.name} ▸ {next_card.subcategory.name}"
+        if card.category and not subcategory_id and category_id:
+            title = f"Review: {card.category.name}"
+        if card.category and card.subcategory and subcategory_id:
+            title = f"Review: {card.category.name} ▸ {card.subcategory.name}"
 
-        embed = _embed_review(title, next_card, points, streak_val)
+        embed = _embed_review(title, card, remaining=len(sess["pool"]), completed=sess["completed"], target=sess["target"])
 
-    # Remember we've shown this in the current session
-    REVIEW_SESSION_SEEN.setdefault((user_id, category_id, subcategory_id), set()).add(next_card.id)
-
-    view = ReviewView(
-        user_id=user_id,
-        scope=scope,
-        category_id=category_id,
-        subcategory_id=subcategory_id,
-        card_id=next_card.id
-    )
-    new_msg = await channel.send(embed=embed, view=view)
-
-    active_reviews[new_msg.id] = {
-        "user_id": user_id,
-        "scope": scope,
-        "card_id": next_card.id,
-        "category_id": category_id,
-        "subcategory_id": subcategory_id,
-    }
-    return new_msg, next_card
+    view = ReviewView(user_id=user_id, category_id=category_id, subcategory_id=subcategory_id, card_id=card.id)
+    msg = await channel.send(embed=embed, view=view)
+    active_reviews[msg.id] = key
+    sess["last"] = card.id
+    return msg, card
 
 
-async def _score_and_advance(
+async def _record_answer_and_maybe_advance(
     channel: discord.abc.MessageableChannel,
-    old_message: Optional[discord.Message],
+    message: Optional[discord.Message],
     user_id: int,
-    scope: str,
     category_id: Optional[int],
     subcategory_id: Optional[int],
     card_id: int,
     correct: bool,
 ):
+    key = _session_key(user_id, category_id, subcategory_id)
+    sess = REVIEW_SESSIONS.get(key)
+    if not sess:
+        if message is not None:
+            try:
+                await message.edit(content="Session expired.", embed=None, view=None)
+            except Exception:
+                pass
+        return
+
     with get_session() as db:
-        card = db.query(Card).filter(Card.id == card_id).one_or_none()
-        if not card:
-            if old_message is not None:
-                try:
-                    await old_message.edit(content="Review expired.", embed=None, view=None)
-                except Exception:
-                    pass
-            return
-
-        # Get/create session score
-        score = db.query(SessionScore).filter(
-            SessionScore.user_id == str(user_id),
-            SessionScore.category_id == (category_id or None),
-            SessionScore.subcategory_id == (subcategory_id or None),
-        ).one_or_none()
-        if not score:
-            score = SessionScore(user_id=str(user_id), category_id=category_id, subcategory_id=subcategory_id, points=0)
-            db.add(score)
-
-        # Per-card stat
-        stat = db.query(ReviewStat).filter(
-            ReviewStat.user_id == str(user_id),
-            ReviewStat.card_id == card_id
-        ).one_or_none()
+        # update per-card stats
+        stat = db.query(ReviewStat).filter(ReviewStat.user_id == str(user_id), ReviewStat.card_id == card_id).one_or_none()
         if not stat:
             stat = ReviewStat(user_id=str(user_id), card_id=card_id, rights=0, wrongs=0)
             db.add(stat)
-
-        delta = 5 if correct else -5
-        stat.rights = (stat.rights or 0) + (1 if correct else 0)
-        stat.wrongs = (stat.wrongs or 0) + (0 if correct else 1)
+        if correct:
+            stat.rights = (stat.rights or 0) + 1
+        else:
+            stat.wrongs = (stat.wrongs or 0) + 1
         stat.last_reviewed_at = datetime.utcnow()
-        score.points += delta
-
-        # streak
-        streak = mark_daily_activity(db, user_id)
-
         db.commit()
 
-        # Win condition: >= 100 points
-        if score.points >= 100:
-            reward = _choose_reward_video()
-            if reward:
-                try:
-                    if reward.lower().startswith(("http://", "https://")):
-                        await channel.send(reward)
-                    else:
-                        await channel.send(file=discord.File(reward))
-                except Exception:
-                    logging.exception("Failed to send reward video")
+    # Only decrement pool / count completion when correct
+    if correct and card_id in sess["pool"]:
+        sess["pool"].discard(card_id)
+        sess["completed"] += 1
 
-            scope_label = "All Categories"
-            if scope == "category" and card.category:
-                scope_label = f"{card.category.name}"
-            elif scope == "subcategory" and card.category and card.subcategory:
-                scope_label = f"{card.category.name} ▸ {card.subcategory.name}"
+    # Completed?
+    if not sess["pool"]:
+        reward = _choose_reward_video()
+        if reward:
+            try:
+                if reward.lower().startswith(("http://", "https://")):
+                    await channel.send(reward)
+                else:
+                    await channel.send(file=discord.File(reward))
+            except Exception:
+                logging.exception("Failed to send reward video")
 
-            await channel.send(f"🎉 <@{user_id}> finished **{scope_label}** with 100 points!\n🔥 **Streak:** {streak.current_streak} day(s)")
-            score.points = 0
-            db.commit()
+        # reward triggers daily streak
+        with get_session() as db:
+            streak = mark_daily_activity(db, user_id)
 
-            if old_message is not None:
-                try:
-                    await old_message.edit(view=None)
-                except Exception:
-                    pass
-            REVIEW_SESSION_SEEN.pop((user_id, category_id, subcategory_id), None)
-            return
+        await channel.send(f"🎉 <@{user_id}> finished the review!\n🔥 **Streak:** {streak.current_streak} day(s)")
+        if message is not None:
+            try:
+                await message.edit(view=None)
+            except Exception:
+                pass
+        # end session
+        REVIEW_SESSIONS.pop(key, None)
+        return
 
-        # Continue with next card
-        new_msg, _ = await _post_next_card(
-            channel=channel,
-            user_id=user_id,
-            scope=scope,
-            category_id=category_id,
-            subcategory_id=subcategory_id,
-            points=score.points,
-            streak_val=streak.current_streak,
-        )
-
-    if old_message is not None:
+    # Otherwise advance
+    new_msg, _ = await _post_next_card(channel, user_id, category_id, subcategory_id)
+    if message is not None:
         try:
-            await old_message.edit(view=None)
+            await message.edit(view=None)
         except Exception:
             pass
+    return new_msg
 
 # ---------------------------------------------------------------------------
 # UI Views
 # ---------------------------------------------------------------------------
 class ReviewView(discord.ui.View):
-    def __init__(self, user_id: int, scope: str, category_id: Optional[int], subcategory_id: Optional[int], card_id: int):
+    def __init__(self, user_id: int, category_id: Optional[int], subcategory_id: Optional[int], card_id: int):
         super().__init__(timeout=1200)
         self.user_id = user_id
-        self.scope = scope
         self.category_id = category_id
         self.subcategory_id = subcategory_id
         self.card_id = card_id
@@ -314,11 +283,10 @@ class ReviewView(discord.ui.View):
             await interaction.response.defer()
         except discord.InteractionResponded:
             pass
-        await _score_and_advance(
+        await _record_answer_and_maybe_advance(
             channel=interaction.channel,
-            old_message=interaction.message,
+            message=interaction.message,
             user_id=self.user_id,
-            scope=self.scope,
             category_id=self.category_id,
             subcategory_id=self.subcategory_id,
             card_id=self.card_id,
@@ -332,176 +300,6 @@ class ReviewView(discord.ui.View):
     @discord.ui.button(label="❌ Incorrect", style=discord.ButtonStyle.danger)
     async def btn_incorrect(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._handle(interaction, False)
-
-
-class EditCardModal(discord.ui.Modal, title="Edit Card"):
-    def __init__(self, opener_user_id: int, card_id: int, original_message: discord.Message, title: str):
-        super().__init__(timeout=300)
-        self.opener_user_id = opener_user_id
-        self.card_id = card_id
-        self.original_message = original_message
-        self.title_text = title
-
-        with get_session() as db:
-            c = db.query(Card).filter(Card.id == self.card_id).one_or_none()
-            q_val = c.question if c else ""
-            a_val = c.answer if c else ""
-
-        self.q = discord.ui.TextInput(label="Question", style=discord.TextStyle.paragraph, default=q_val, required=True, max_length=2000)
-        self.a = discord.ui.TextInput(label="Answer", style=discord.TextStyle.paragraph, default=a_val, required=True, max_length=2000)
-        self.add_item(self.q)
-        self.add_item(self.a)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.opener_user_id:
-            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
-            return
-        new_q = str(self.q.value).strip()
-        new_a = str(self.a.value).strip()
-        with get_session() as db:
-            c = db.query(Card).filter(Card.id == self.card_id).one_or_none()
-            if not c:
-                await interaction.response.send_message("This card no longer exists.", ephemeral=True)
-                return
-            c.question = new_q
-            c.answer = new_a
-            db.commit()
-            db.refresh(c)
-        try:
-            await self.original_message.edit(
-                embed=_embed_card_display(self.title_text, c),
-                view=CardManageView(self.opener_user_id, self.card_id, self.title_text)
-            )
-        except Exception:
-            pass
-        await interaction.response.send_message("Saved changes.", ephemeral=True)
-
-
-class ConfirmDeleteView(discord.ui.View):
-    def __init__(self, opener_user_id: int, card_id: int):
-        super().__init__(timeout=60)
-        self.opener_user_id = opener_user_id
-        self.card_id = card_id
-
-    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opener_user_id:
-            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
-            return
-        with get_session() as db:
-            c = db.query(Card).filter(Card.id == self.card_id).one_or_none()
-            if not c:
-                await interaction.response.send_message("Already deleted.", ephemeral=True)
-                return
-            db.delete(c)
-            db.commit()
-        await interaction.message.edit(content="🗑️ Card deleted.", embed=None, view=None)
-        await interaction.response.send_message("Deleted.", ephemeral=True)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        await interaction.message.edit(view=None)
-
-
-class CardManageView(discord.ui.View):
-    def __init__(self, opener_user_id: int, card_id: int, title: str):
-        super().__init__(timeout=900)
-        self.opener_user_id = opener_user_id
-        self.card_id = card_id
-        self.title = title
-
-    @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary)
-    async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opener_user_id:
-            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
-            return
-        await interaction.response.send_modal(EditCardModal(self.opener_user_id, self.card_id, interaction.message, self.title))
-
-    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger)
-    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opener_user_id:
-            await interaction.response.send_message("You didn’t open this card.", ephemeral=True)
-            return
-        await interaction.response.edit_message(view=ConfirmDeleteView(self.opener_user_id, self.card_id))
-
-
-# pagination for list
-def _chunk(lst: List, size: int) -> List[List]:
-    return [lst[i:i + size] for i in range(0, len(lst), size)]
-
-
-class ListCardsButtonsView(discord.ui.View):
-    PAGE_SIZE = 10
-
-    def __init__(self, user_id: int, pairs: List[tuple[int, str]], title: str):
-        super().__init__(timeout=900)
-        self.user_id = user_id
-        self.title = title
-        self.pages = _chunk(pairs, self.PAGE_SIZE) or [[]]
-        self.page_index = 0
-        self._rebuild()
-
-    def _rebuild(self):
-        # Clear existing
-        for it in list(self.children):
-            self.remove_item(it)
-
-        # Card buttons
-        for cid, q in self.pages[self.page_index]:
-            label = (q[:72] + "…") if len(q) > 75 else q
-            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
-
-            async def _cb(interaction: discord.Interaction, card_id=cid):
-                if interaction.user.id != self.user_id:
-                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
-                    return
-                with get_session() as db:
-                    card = db.query(Card).filter(Card.id == card_id).one_or_none()
-                    if not card:
-                        await interaction.response.send_message("That card was not found.", ephemeral=True)
-                        return
-                    scope_title = card.category.name if card.category else "Cards"
-                    if card.subcategory and card.category:
-                        scope_title = f"{card.category.name} ▸ {card.subcategory.name}"
-                    embed = _embed_card_display(scope_title, card)
-                view = CardManageView(self.user_id, card_id, scope_title)
-                await interaction.channel.send(embed=embed, view=view)
-                try:
-                    await interaction.response.defer()
-                except discord.InteractionResponded:
-                    pass
-
-            btn.callback = _cb
-            self.add_item(btn)
-
-        # Pagination controls
-        if len(self.pages) > 1:
-            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
-            page_label = discord.ui.Button(label=f"Page {self.page_index + 1}/{len(self.pages)}", style=discord.ButtonStyle.secondary, disabled=True)
-
-            async def prev_cb(interaction: discord.Interaction):
-                if interaction.user.id != self.user_id:
-                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
-                    return
-                self.page_index = (self.page_index - 1) % len(self.pages)
-                self._rebuild()
-                await interaction.response.edit_message(view=self)
-
-            async def next_cb(interaction: discord.Interaction):
-                if interaction.user.id != self.user_id:
-                    await interaction.response.send_message("This list belongs to someone else.", ephemeral=True)
-                    return
-                self.page_index = (self.page_index + 1) % len(self.pages)
-                self._rebuild()
-                await interaction.response.edit_message(view=self)
-
-            prev_btn.callback = prev_cb
-            next_btn.callback = next_cb
-            self.add_item(prev_btn)
-            self.add_item(page_label)
-            self.add_item(next_btn)
 
 # ---------------------------------------------------------------------------
 # Events
@@ -527,10 +325,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if bot.user and payload.user_id == bot.user.id:
             return
 
-        state = active_reviews.get(payload.message_id)
-        if not state:
+        key = active_reviews.get(payload.message_id)
+        if not key:
             return
-        if state.get("user_id") != payload.user_id:
+
+        user_id, category_id, subcategory_id = key
+        if user_id != payload.user_id:
             return
 
         emoji = str(payload.emoji)
@@ -538,11 +338,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             return
 
         now = time.time()
-        key = (payload.message_id, payload.user_id)
-        last = _last_handle.get(key, 0.0)
+        dkey = (payload.message_id, payload.user_id)
+        last = _last_handle.get(dkey, 0.0)
         if last + 0.8 > now:
             return
-        _last_handle[key] = now
+        _last_handle[dkey] = now
 
         channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
         old_message = None
@@ -553,17 +353,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             pass
 
         correct = (emoji == "✅")
-        user_id = payload.user_id
-        scope = state.get("scope")
-        category_id = state.get("category_id")
-        subcategory_id = state.get("subcategory_id")
-        card_id = state.get("card_id")
+        # current card id is the session's "last"
+        sess = REVIEW_SESSIONS.get(key)
+        card_id = sess.get("last") if sess else None
+        if card_id is None:
+            return
 
-        await _score_and_advance(
+        await _record_answer_and_maybe_advance(
             channel=channel,
-            old_message=old_message,
+            message=old_message,
             user_id=user_id,
-            scope=scope,
             category_id=category_id,
             subcategory_id=subcategory_id,
             card_id=card_id,
@@ -578,7 +377,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-@bot.tree.command(description="Show commands")
+@bot.tree.command(description="Show MilesMinder commands")
 async def helpmiles(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**Commands**\n"
@@ -588,7 +387,7 @@ async def helpmiles(interaction: discord.Interaction):
         "/editsubcategory category old_subcategory [new_subcategory] [delete]\n"
         "/addcard question answer [category] [subcategory]\n"
         "/listcards scope:[all|category|subcategory] [category] [subcategory]\n"
-        "/reviewcards scope:[all|category|subcategory] [category] [subcategory]\n"
+        "/reviewcards mode:[20|50|all] [category] [subcategory]\n"
         "/sync — force resync commands",
         ephemeral=True
     )
@@ -606,6 +405,7 @@ async def sync(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"Sync failed: {e}", ephemeral=True)
 
+# ----- Category & Subcategory management -----
 @bot.tree.command(description="Add a new category")
 async def addcategory(interaction: discord.Interaction, name: str):
     with get_session() as db:
@@ -664,6 +464,7 @@ async def editsubcategory(interaction: discord.Interaction, category: str, old_s
             return
         await interaction.response.send_message("No changes provided.", ephemeral=True)
 
+# ----- Cards -----
 @bot.tree.command(description="Add a flashcard")
 async def addcard(interaction: discord.Interaction, question: str, answer: str, category: Optional[str] = None, subcategory: Optional[str] = None):
     with get_session() as db:
@@ -684,17 +485,9 @@ async def ac_addcard_subcategory(interaction: discord.Interaction, current: str)
 
 @bot.tree.command(description="List cards (scope: all/category/subcategory)")
 async def listcards(interaction: discord.Interaction, scope: str, category: Optional[str] = None, subcategory: Optional[str] = None):
-    scope = scope.lower().strip()
+    scope = (scope or "all").lower().strip()
     with get_session() as db:
-        title = "All Categories"
-        if scope == "category":
-            cat = db.query(Category).filter(Category.name.ilike((category or '').strip())).one_or_none()
-            if not cat:
-                await interaction.response.send_message("Category not found.", ephemeral=True)
-                return
-            title = cat.name
-            cards = db.query(Card).filter(Card.category_id == cat.id).order_by(Card.question.asc()).all()
-        elif scope == "subcategory":
+        if scope == "subcategory":
             cat = db.query(Category).filter(Category.name.ilike((category or '').strip())).one_or_none()
             if not cat:
                 await interaction.response.send_message("Category not found.", ephemeral=True)
@@ -708,111 +501,26 @@ async def listcards(interaction: discord.Interaction, scope: str, category: Opti
                 return
             title = f"{cat.name} ▸ {sub.name}"
             cards = db.query(Card).filter(Card.subcategory_id == sub.id).order_by(Card.question.asc()).all()
+        elif scope == "category":
+            cat = db.query(Category).filter(Category.name.ilike((category or '').strip())).one_or_none()
+            if not cat:
+                await interaction.response.send_message("Category not found.", ephemeral=True)
+                return
+            title = f"{cat.name}"
+            cards = db.query(Card).filter(Card.category_id == cat.id).order_by(Card.question.asc()).all()
         else:
+            title = "All Categories"
             cards = db.query(Card).order_by(Card.question.asc()).all()
 
         if not cards:
             await interaction.response.send_message("No cards found.", ephemeral=True)
             return
 
-        pairs = [(c.id, c.question) for c in cards]
-
-    # Show a textual list (truncated) and a button panel to open any card
-    lines = [f"{i + 1}. {q}" for i, (_, q) in enumerate(pairs)]
-    text = f"**{title}** — {len(pairs)} card(s):\n" + "\n".join(lines[:50])
-    if len(pairs) > 50:
-        text += f"\n… ({len(pairs) - 50} more; use buttons to open any card)"
-    await interaction.response.send_message(text)
-    await interaction.followup.send(
-        "Open a card by pressing its button:",
-        view=ListCardsButtonsView(interaction.user.id, pairs, title),
-        ephemeral=True
-    )
-
-@bot.tree.command(description="Review cards (scope: all/category/subcategory)")
-async def reviewcards(interaction: discord.Interaction, scope: str, category: Optional[str] = None, subcategory: Optional[str] = None):
-    scope = scope.lower().strip()
-    user_id = interaction.user.id
-    with get_session() as db:
-        cat_id = None
-        sub_id = None
-
-        if scope == "category":
-            cat = db.query(Category).filter(Category.name.ilike((category or '').strip())).one_or_none()
-            if not cat:
-                await interaction.response.send_message("Category not found.", ephemeral=True)
-                return
-            cat_id = cat.id
-        elif scope == "subcategory":
-            cat = db.query(Category).filter(Category.name.ilike((category or '').strip())).one_or_none()
-            if not cat:
-                await interaction.response.send_message("Category not found.", ephemeral=True)
-                return
-            sub = db.query(Subcategory).filter(
-                Subcategory.category_id == cat.id,
-                Subcategory.name.ilike((subcategory or '').strip())
-            ).one_or_none()
-            if not sub:
-                await interaction.response.send_message("Subcategory not found.", ephemeral=True)
-                return
-            cat_id = cat.id
-            sub_id = sub.id
-        elif scope != "all":
-            await interaction.response.send_message("Scope must be one of: all, category, subcategory.", ephemeral=True)
-            return
-
-        exist = _candidate_cards(db, scope, cat_id, sub_id)
-        if not exist:
-            await interaction.response.send_message("No cards available for that selection.", ephemeral=True)
-            return
-
-        # Ensure a session score row exists
-        score = db.query(SessionScore).filter(
-            SessionScore.user_id == str(user_id),
-            SessionScore.category_id == (cat_id or None),
-            SessionScore.subcategory_id == (sub_id or None),
-        ).one_or_none()
-        if not score:
-            score = SessionScore(user_id=str(user_id), category_id=cat_id, subcategory_id=sub_id, points=0)
-            db.add(score)
-            db.commit()
-
-        # fresh "seen" set for this scope to avoid repeats until pool exhaustion
-        REVIEW_SESSION_SEEN[(user_id, cat_id, sub_id)] = set()
-        first = _pick_next_card(db, user_id, scope, cat_id, sub_id, exclude_ids=REVIEW_SESSION_SEEN[(user_id, cat_id, sub_id)])
-        if not first:
-            await interaction.response.send_message("No cards available.", ephemeral=True)
-            return
-        REVIEW_SESSION_SEEN[(user_id, cat_id, sub_id)].add(first.id)
-
-        streak = db.query(Streak).filter(Streak.user_id == str(user_id)).one_or_none()
-        streak_val = streak.current_streak if streak else 0
-
-        title = "Review: All Categories"
-        if scope == "category" and first.category:
-            title = f"Review: {first.category.name}"
-        if scope == "subcategory" and first.subcategory and first.category:
-            title = f"Review: {first.category.name} ▸ {first.subcategory.name}"
-        embed = _embed_review(title, first, score.points, streak_val)
-
-    await interaction.response.send_message("Review started. Use the buttons or react with ✅/❌.", ephemeral=True)
-    view = ReviewView(user_id=user_id, scope=scope, category_id=cat_id, subcategory_id=sub_id, card_id=first.id)
-    sent = await interaction.channel.send(embed=embed, view=view)
-    active_reviews[sent.id] = {
-        "user_id": user_id,
-        "scope": scope,
-        "card_id": first.id,
-        "category_id": cat_id,
-        "subcategory_id": sub_id,
-    }
-
-# ----------------------------
-# Autocomplete handlers
-# ----------------------------
-@addcategory.autocomplete("name")
-async def ac_addcategory_name(interaction: discord.Interaction, current: str):
-    # Creating a new name - no suggestions needed
-    return []
+        lines = [f"{i+1}. {c.question}" for i, c in enumerate(cards[:50])]
+        text = f"**{title}** — {len(cards)} card(s):\n" + "\n".join(lines)
+        if len(cards) > 50:
+            text += f"\n… ({len(cards) - 50} more not shown)"
+    await interaction.response.send_message(text, ephemeral=True)
 
 @listcards.autocomplete("category")
 async def ac_listcards_category(interaction: discord.Interaction, current: str):
@@ -821,6 +529,65 @@ async def ac_listcards_category(interaction: discord.Interaction, current: str):
 @listcards.autocomplete("subcategory")
 async def ac_listcards_subcategory(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=n, value=n.split(' ▸ ')[-1]) for n in _subcategory_names(current)]
+
+# ----- Review -----
+@bot.tree.command(description="Review cards: mode=[20|50|all] with optional category/subcategory")
+async def reviewcards(interaction: discord.Interaction, mode: str, category: Optional[str] = None, subcategory: Optional[str] = None):
+    mode = (mode or "20").lower().strip()
+    if mode not in ("20", "50", "all"):
+        await interaction.response.send_message("Mode must be one of: 20, 50, all.", ephemeral=True)
+        return
+
+    user_id = interaction.user.id
+
+    with get_session() as db:
+        cat_id = None
+        sub_id = None
+        cards: List[Card] = []
+
+        if subcategory and not category:
+            await interaction.response.send_message("Please provide a category when specifying a subcategory.", ephemeral=True)
+            return
+
+        if category:
+            cat = db.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
+            if not cat:
+                await interaction.response.send_message("Category not found.", ephemeral=True)
+                return
+            cat_id = cat.id
+
+        if category and subcategory:
+            sub = db.query(Subcategory).filter(
+                Subcategory.category_id == cat_id,
+                Subcategory.name.ilike(subcategory.strip())
+            ).one_or_none()
+            if not sub:
+                await interaction.response.send_message("Subcategory not found.", ephemeral=True)
+                return
+            sub_id = sub.id
+
+        cards = _candidate_cards(db, cat_id, sub_id)
+        if not cards:
+            await interaction.response.send_message("No cards available for that selection.", ephemeral=True)
+            return
+
+        card_ids = [c.id for c in cards]
+        pool, target = _prepare_pool(card_ids, mode)
+
+    key = _session_key(user_id, cat_id, sub_id)
+    REVIEW_SESSIONS[key] = {"pool": pool, "target": target, "completed": 0, "last": None}
+
+    await interaction.response.send_message(
+        f"Review started: **mode {mode}** — {target} unique card(s) to complete.",
+        ephemeral=True
+    )
+
+    await _post_next_card(
+        channel=interaction.channel,
+        user_id=user_id,
+        category_id=cat_id,
+        subcategory_id=sub_id,
+    )
 
 @reviewcards.autocomplete("category")
 async def ac_review_category(interaction: discord.Interaction, current: str):
@@ -844,4 +611,3 @@ if __name__ == "__main__":
         logging.exception("Fatal error during startup")
         time.sleep(60)
         raise
-
