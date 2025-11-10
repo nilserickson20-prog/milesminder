@@ -1,14 +1,12 @@
+# bot.py
 from __future__ import annotations
 
-import asyncio
-import datetime as dt
-import logging
 import os
-import random
+import io
 import sqlite3
-import string
-import uuid
-from dataclasses import dataclass
+import random
+import logging
+import datetime as dt
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -16,554 +14,689 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ---------------------------- Logging ---------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ---------------------------
+# Logging
+# ---------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("milesminder")
 
-# ------------------------- Environment --------------------------------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
-GUILD_ID_STR = os.getenv("DISCORD_GUILD_ID", "").strip()
-GUILD_ID = int(GUILD_ID_STR) if GUILD_ID_STR.isdigit() else None
+# ---------------------------
+# Configuration / Env
+# ---------------------------
+TOKEN = os.getenv("DISCORD_TOKEN")
+CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional (fast sync if set)
+REWARD_DIR = Path(os.getenv("REWARD_VIDEOS_DIR", "./rewards")).resolve()
+DB_PATH = Path(os.getenv("DB_PATH", "./data/milesminder.db")).resolve()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Path for sqlite on Fly io volume (/data is mounted writeable)
-DB_PATH = Path(os.getenv("DB_PATH", "/data/milesminder.db"))
+if not TOKEN:
+    log.error("Missing DISCORD_TOKEN. Exiting.")
+    raise SystemExit(1)
 
-REWARDS_DIR = Path(os.getenv("REWARDS_DIR", "/app/rewards"))
-REWARD_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".gif"}
+# ---------------------------
+# Discord client & intents
+# ---------------------------
+intents = discord.Intents.default()
+intents.message_content = False  # not needed for slash commands
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ------------------------ Database layer -------------------------------
-def get_conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ---------------------------
+# SQLite helpers & schema
+# ---------------------------
+def db_connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    con.row_factory = sqlite3.Row
+    return con
 
 def migrate_schema() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
+    con = db_connect()
+    cur = con.cursor()
 
-    # Core tables
+    # categories
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS categories(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS subcategories(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            UNIQUE(category_id, name),
-            FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cards(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            card_number TEXT UNIQUE NOT NULL,
-            question TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            category_id INTEGER,
-            subcategory_id INTEGER,
-            FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL,
-            FOREIGN KEY(subcategory_id) REFERENCES subcategories(id) ON DELETE SET NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id TEXT PRIMARY KEY,
-            streak INTEGER NOT NULL DEFAULT 0,
-            last_reward_date TEXT
-        )
+    CREATE TABLE IF NOT EXISTS categories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL
+    )
     """)
 
-    # Helpful indices
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_category ON cards(category_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_subcategory ON cards(subcategory_id)")
-
-    conn.commit()
-    conn.close()
-
-# Category helpers
-def ensure_category(name: str) -> int:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (name.strip(),))
-    conn.commit()
-    cur.execute("SELECT id FROM categories WHERE name=?", (name.strip(),))
-    row = cur.fetchone()
-    conn.close()
-    return int(row["id"])
-
-def ensure_subcategory(category_id: int, name: str) -> int:
-    conn = get_conn(); cur = conn.cursor()
+    # subcategories
     cur.execute("""
-        INSERT OR IGNORE INTO subcategories(category_id, name) VALUES (?, ?)
-    """, (category_id, name.strip()))
-    conn.commit()
-    cur.execute("SELECT id FROM subcategories WHERE category_id=? AND name=?", (category_id, name.strip()))
-    row = cur.fetchone()
-    conn.close()
-    return int(row["id"])
+    CREATE TABLE IF NOT EXISTS subcategories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      category_id INTEGER NOT NULL,
+      UNIQUE(name, category_id),
+      FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
+    )
+    """)
 
-def list_categories(prefix: str = "") -> List[sqlite3.Row]:
-    conn = get_conn(); cur = conn.cursor()
-    if prefix:
-        cur.execute("SELECT * FROM categories WHERE name LIKE ? ORDER BY name LIMIT 25", (f"%{prefix}%",))
-    else:
-        cur.execute("SELECT * FROM categories ORDER BY name LIMIT 25")
+    # cards
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cards (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      card_number TEXT UNIQUE NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      category_id INTEGER,
+      subcategory_id INTEGER,
+      FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL,
+      FOREIGN KEY(subcategory_id) REFERENCES subcategories(id) ON DELETE SET NULL
+    )
+    """)
+    # Add missing indexes
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_category_id ON cards(category_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_subcategory_id ON cards(subcategory_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_question ON cards(question)")
+
+    # streaks (rewards awarded per calendar day)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_streaks (
+      user_id INTEGER PRIMARY KEY,
+      last_reward_date TEXT, -- YYYY-MM-DD
+      streak INTEGER NOT NULL DEFAULT 0
+    )
+    """)
+
+    con.commit()
+    con.close()
+
+def today_str() -> str:
+    tz = os.getenv("TZ")
+    now = dt.datetime.now(dt.timezone.utc).astimezone() if not tz else dt.datetime.now()
+    return now.date().isoformat()
+
+def touch_category(name: str) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
+    con.commit()
+    cur.execute("SELECT id FROM categories WHERE name=?", (name,))
+    cid = cur.fetchone()["id"]
+    con.close()
+    return cid
+
+def touch_subcategory(category_id: int, name: str) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO subcategories(name, category_id) VALUES(?,?)", (name, category_id))
+    con.commit()
+    cur.execute("SELECT id FROM subcategories WHERE name=? AND category_id=?", (name, category_id))
+    sid = cur.fetchone()["id"]
+    con.close()
+    return sid
+
+def generate_card_number(con: sqlite3.Connection) -> str:
+    # e.g. MM-XXXXX
+    cur = con.cursor()
+    while True:
+        n = f"MM-{random.randint(10000, 99999)}"
+        cur.execute("SELECT 1 FROM cards WHERE card_number=?", (n,))
+        if not cur.fetchone():
+            return n
+
+def list_categories_like(q: str) -> List[sqlite3.Row]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT id, name FROM categories WHERE name LIKE ? ORDER BY name LIMIT 25", (f"%{q}%",))
     rows = cur.fetchall()
-    conn.close()
+    con.close()
     return rows
 
-def list_subcategories(category_id: int, prefix: str = "") -> List[sqlite3.Row]:
-    conn = get_conn(); cur = conn.cursor()
-    if prefix:
+def list_subcategories_like(category_id: Optional[int], q: str) -> List[sqlite3.Row]:
+    con = db_connect()
+    cur = con.cursor()
+    if category_id:
         cur.execute("""
-            SELECT * FROM subcategories
+            SELECT id, name FROM subcategories
             WHERE category_id=? AND name LIKE ?
             ORDER BY name LIMIT 25
-        """, (category_id, f"%{prefix}%"))
+        """, (category_id, f"%{q}%"))
     else:
         cur.execute("""
-            SELECT * FROM subcategories
-            WHERE category_id=?
+            SELECT id, name FROM subcategories
+            WHERE name LIKE ?
             ORDER BY name LIMIT 25
-        """, (category_id,))
+        """, (f"%{q}%",))
     rows = cur.fetchall()
-    conn.close()
+    con.close()
     return rows
 
-# Card helpers
-def generate_card_number() -> str:
-    # Short unique token: 8 chars base36 + 4 hex
-    a = uuid.uuid4().int % (36**8)
-    token = base36(a).rjust(8, "0")
-    return f"{token}-{uuid.uuid4().hex[:4]}"
-
-def base36(num: int) -> str:
-    chars = string.digits + string.ascii_lowercase
-    if num == 0: return "0"
-    out = []
-    while num:
-        num, r = divmod(num, 36)
-        out.append(chars[r])
-    return "".join(reversed(out))
-
-def add_card(question: str, answer: str, category_id: Optional[int], subcategory_id: Optional[int]) -> str:
-    conn = get_conn(); cur = conn.cursor()
-    card_number = generate_card_number()
-    cur.execute("""
-        INSERT INTO cards(card_number, question, answer, category_id, subcategory_id)
-        VALUES (?, ?, ?, ?, ?)
-    """, (card_number, question.strip(), answer.strip(), category_id, subcategory_id))
-    conn.commit()
-    conn.close()
-    return card_number
-
-def get_candidate_cards(category_id: Optional[int], subcategory_id: Optional[int]) -> List[sqlite3.Row]:
-    conn = get_conn(); cur = conn.cursor()
-    if category_id and subcategory_id:
-        cur.execute("SELECT * FROM cards WHERE category_id=? AND subcategory_id=?",
-                    (category_id, subcategory_id))
+def fetch_cards(category_id: Optional[int], subcategory_id: Optional[int]) -> List[sqlite3.Row]:
+    con = db_connect()
+    cur = con.cursor()
+    if subcategory_id:
+        cur.execute("SELECT * FROM cards WHERE subcategory_id=? ORDER BY question COLLATE NOCASE", (subcategory_id,))
     elif category_id:
-        cur.execute("SELECT * FROM cards WHERE category_id=?", (category_id,))
+        cur.execute("SELECT * FROM cards WHERE category_id=? ORDER BY question COLLATE NOCASE", (category_id,))
     else:
-        cur.execute("SELECT * FROM cards")
+        cur.execute("SELECT * FROM cards ORDER BY question COLLATE NOCASE")
     rows = cur.fetchall()
-    conn.close()
+    con.close()
     return rows
 
-def get_card(card_id: int) -> Optional[sqlite3.Row]:
-    conn = get_conn(); cur = conn.cursor()
+def fetch_card(card_id: int) -> Optional[sqlite3.Row]:
+    con = db_connect()
+    cur = con.cursor()
     cur.execute("SELECT * FROM cards WHERE id=?", (card_id,))
     row = cur.fetchone()
-    conn.close()
+    con.close()
     return row
 
-# Users / streak logic
-def mark_reward_and_get_streak(user_id: int) -> int:
-    today = dt.date.today().isoformat()
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT user_id, streak, last_reward_date FROM users WHERE user_id=?", (str(user_id),))
+def upsert_streak_and_maybe_increment(user_id: int) -> int:
+    """Increment streak if user hasn't received a reward today."""
+    con = db_connect()
+    cur = con.cursor()
+    t = today_str()
+    cur.execute("SELECT user_id, last_reward_date, streak FROM user_streaks WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     if not row:
-        cur.execute("INSERT INTO users(user_id, streak, last_reward_date) VALUES (?, ?, ?)",
-                    (str(user_id), 1, today))
-        conn.commit()
-        conn.close()
+        cur.execute("INSERT INTO user_streaks(user_id, last_reward_date, streak) VALUES (?,?,?)",
+                    (user_id, t, 1))
+        con.commit()
+        con.close()
         return 1
-
-    streak = int(row["streak"] or 0)
     last = row["last_reward_date"]
-    # Only increment once per day
-    if last != today:
+    streak = row["streak"]
+    if last != t:
         streak += 1
-        cur.execute("UPDATE users SET streak=?, last_reward_date=? WHERE user_id=?",
-                    (streak, today, str(user_id)))
-        conn.commit()
-    conn.close()
+        cur.execute("UPDATE user_streaks SET last_reward_date=?, streak=? WHERE user_id=?",
+                    (t, streak, user_id))
+        con.commit()
+    con.close()
     return streak
 
-# ------------------------ Discord bot setup ----------------------------
-intents = discord.Intents.default()
-intents.guilds = True  # slash commands primarily
+def get_streak(user_id: int) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT streak FROM user_streaks WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    return row["streak"] if row else 0
 
-class MilesBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+# ---------------------------
+# Autocomplete helpers
+# ---------------------------
+async def _ac_category(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    rows = list_categories_like(current or "")
+    return [app_commands.Choice(name=r["name"], value=str(r["id"])) for r in rows]
 
-    async def setup_hook(self):
-        # ensure DB migration before command sync
+async def _ac_subcategory(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    cat_val = interaction.namespace.category
+    cat_id = int(cat_val) if cat_val else None
+    rows = list_subcategories_like(cat_id, current or "")
+    return [app_commands.Choice(name=r["name"], value=str(r["id"])) for r in rows]
+
+# ---------------------------
+# UI views
+# ---------------------------
+class CardView(discord.ui.View):
+    def __init__(self, card_id: int, can_edit: bool = True, timeout: Optional[float] = 300):
+        super().__init__(timeout=timeout)
+        self.card_id = card_id
+        if can_edit:
+            self.add_item(EditCardButton(card_id))
+            self.add_item(DeleteCardButton(card_id))
+
+class EditCardButton(discord.ui.Button):
+    def __init__(self, card_id: int):
+        super().__init__(style=discord.ButtonStyle.secondary, label="Edit")
+        self.card_id = card_id
+
+    async def callback(self, interaction: discord.Interaction):
+        card = fetch_card(self.card_id)
+        if not card:
+            return await interaction.response.send_message("Card not found.", ephemeral=True)
+
+        modal = EditCardModal(self.card_id, card["question"], card["answer"])
+        await interaction.response.send_modal(modal)
+
+class DeleteCardButton(discord.ui.Button):
+    def __init__(self, card_id: int):
+        super().__init__(style=discord.ButtonStyle.danger, label="Delete")
+        self.card_id = card_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Confirm delete?", view=ConfirmDeleteView(self.card_id), ephemeral=True
+        )
+
+class ConfirmDeleteView(discord.ui.View):
+    def __init__(self, card_id: int):
+        super().__init__(timeout=30)
+        self.card_id = card_id
+
+    @discord.ui.button(style=discord.ButtonStyle.danger, label="Yes, delete")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("DELETE FROM cards WHERE id=?", (self.card_id,))
+        con.commit()
+        con.close()
+        await interaction.response.edit_message(content="Card deleted.", view=None)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary, label="Cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+class EditCardModal(discord.ui.Modal, title="Edit Card"):
+    q = discord.ui.TextInput(label="Question", style=discord.TextStyle.paragraph, max_length=2000)
+    a = discord.ui.TextInput(label="Answer", style=discord.TextStyle.paragraph, max_length=4000)
+
+    def __init__(self, card_id: int, question: str, answer: str):
+        super().__init__(timeout=300)
+        self.card_id = card_id
+        self.q.default = question
+        self.a.default = answer
+
+    async def on_submit(self, interaction: discord.Interaction):
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("UPDATE cards SET question=?, answer=? WHERE id=?", (str(self.q), str(self.a), self.card_id))
+        con.commit()
+        con.close()
+        await interaction.response.send_message("Card updated.", ephemeral=True)
+
+# Review session per message
+class ReviewView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        deck_ids: List[int],
+        target: int,
+        asked: Optional[set[int]] = None,
+        timeout: Optional[float] = 900,
+    ):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.deck_ids = deck_ids[:]  # pool
+        self.target = target  # 20, 50, or len(deck)
+        self.asked: set[int] = asked or set()
+        self.current_card_id: Optional[int] = None
+
+        self.correct = discord.ui.Button(style=discord.ButtonStyle.success, label="✅ Correct")
+        self.wrong = discord.ui.Button(style=discord.ButtonStyle.secondary, label="❌ Wrong")
+        self.correct.callback = self._mark_correct
+        self.wrong.callback = self._mark_wrong
+        self.add_item(self.correct)
+        self.add_item(self.wrong)
+
+    def _pick_next_id(self) -> Optional[int]:
+        remaining = [cid for cid in self.deck_ids if cid not in self.asked]
+        if not remaining:
+            return None
+        return random.choice(remaining)
+
+    async def start_or_advance(self, interaction: discord.Interaction):
+        # finish?
+        if len(self.asked) >= self.target:
+            await self._finish(interaction)
+            return
+
+        next_id = self._pick_next_id()
+        if next_id is None:
+            await self._finish(interaction)
+            return
+
+        self.current_card_id = next_id
+        self.asked.add(next_id)
+        card = fetch_card(next_id)
+        if not card:
+            await interaction.response.send_message("Card not found; skipping.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Question",
+            description=card["question"],
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _mark_correct(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("This review is not for you.", ephemeral=True)
+        # show answer then move on
+        await self._show_answer_then_next(interaction)
+
+    async def _mark_wrong(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("This review is not for you.", ephemeral=True)
+        # show answer then move on
+        await self._show_answer_then_next(interaction)
+
+    async def _show_answer_then_next(self, interaction: discord.Interaction):
+        card = fetch_card(self.current_card_id) if self.current_card_id else None
+        if not card:
+            await interaction.response.send_message("Missing card.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Answer",
+            description=card["answer"],
+            color=discord.Color.green(),
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+        # Small delay-like UX by deferring and then advancing with a followup edit
+        await interaction.followup.send("Next card coming…", ephemeral=True, wait=True)
+        # Advance
+        # NOTE: for component interactions, you can't call edit on the same response twice in a row;
+        # we re-edit the original message via message reference:
         try:
-            migrate_schema()
+            # use the original message via interaction.message
+            await self._advance_via_followup(interaction)
         except Exception as e:
-            log.error(f"Schema migration failed: {e}")
-            raise
+            log.exception("advance error: %s", e)
 
-        pre = [c.name for c in self.tree.get_commands()]
-        log.info(f"Pre-sync global commands: {pre}")
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            pre_g = [c.name for c in self.tree.get_commands(guild=guild)]
-            log.info(f"Pre-sync guild commands ({GUILD_ID}): {pre_g}")
+    async def _advance_via_followup(self, interaction: discord.Interaction):
+        # Use a fresh token to edit the original message again with next card
+        if len(self.asked) >= self.target:
+            await self._finish(interaction)
+            return
+        next_id = self._pick_next_id()
+        if next_id is None:
+            await self._finish(interaction)
+            return
 
-        # Sync
-        if GUILD_ID:
-            synced = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-            log.info(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+        self.current_card_id = next_id
+        self.asked.add(next_id)
+        card = fetch_card(next_id)
+        if not card:
+            await interaction.followup.send("Card not found; skipping.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Question",
+            description=card["question"],
+            color=discord.Color.blurple(),
+        )
+        # edit the original message (interaction.message) with new content
+        await interaction.message.edit(embed=embed, view=self)
+
+    async def _finish(self, interaction: discord.Interaction):
+        # Reward (video) then streak line
+        files = []
+        if REWARD_DIR.exists() and REWARD_DIR.is_dir():
+            vids = [p for p in REWARD_DIR.iterdir() if p.suffix.lower() in {".mp4", ".mov", ".webm", ".m4v"}]
+            if vids:
+                chosen = random.choice(vids)
+                try:
+                    files.append(discord.File(fp=str(chosen), filename=chosen.name))
+                except Exception as e:
+                    log.warning("Could not attach reward video: %s", e)
+
+        streak = upsert_streak_and_maybe_increment(self.user_id)
+        msg = f"✅ Review complete! Streak: **{streak}🔥**"
+
+        if files:
+            await interaction.response.edit_message(content=msg, embed=None, attachments=files, view=None)
         else:
-            synced = await self.tree.sync()
-            log.info(f"Synced {len(synced)} global commands.")
+            await interaction.response.edit_message(content=msg, embed=None, view=None)
 
-bot = MilesBot()
+# ---------------------------
+# Slash Commands
+# ---------------------------
+
+@bot.tree.command(name="addcategory", description="Create a category.")
+@app_commands.describe(name="Category name")
+async def addcategory(interaction: discord.Interaction, name: str):
+    cid = touch_category(name.strip())
+    await interaction.response.send_message(f"Category **{name}** created (id {cid}).", ephemeral=True)
+
+@bot.tree.command(name="editcategory", description="Rename a category.")
+@app_commands.describe(category="Choose a category", new_name="New category name")
+@app_commands.autocomplete(category=_ac_category)
+async def editcategory(interaction: discord.Interaction, category: Optional[str], new_name: str):
+    if not category:
+        return await interaction.response.send_message("Pick a category.", ephemeral=True)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("UPDATE categories SET name=? WHERE id=?", (new_name.strip(), int(category)))
+    con.commit()
+    con.close()
+    await interaction.response.send_message("Category renamed.", ephemeral=True)
+
+@bot.tree.command(name="deletecategory", description="Delete a category.")
+@app_commands.describe(category="Choose a category")
+@app_commands.autocomplete(category=_ac_category)
+async def deletecategory(interaction: discord.Interaction, category: Optional[str]):
+    if not category:
+        return await interaction.response.send_message("Pick a category.", ephemeral=True)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("DELETE FROM categories WHERE id=?", (int(category),))
+    con.commit()
+    con.close()
+    await interaction.response.send_message("Category deleted.", ephemeral=True)
+
+@bot.tree.command(name="addsubcategory", description="Create a subcategory.")
+@app_commands.describe(category="Choose a category", name="Subcategory name")
+@app_commands.autocomplete(category=_ac_category)
+async def addsubcategory(interaction: discord.Interaction, category: Optional[str], name: str):
+    if not category:
+        return await interaction.response.send_message("Pick a parent category.", ephemeral=True)
+    sid = touch_subcategory(int(category), name.strip())
+    await interaction.response.send_message(f"Subcategory **{name}** created (id {sid}).", ephemeral=True)
+
+@bot.tree.command(name="editsubcategory", description="Rename a subcategory.")
+@app_commands.describe(category="Choose the parent category", subcategory="Choose a subcategory", new_name="New name")
+@app_commands.autocomplete(category=_ac_category, subcategory=_ac_subcategory)
+async def editsubcategory(interaction: discord.Interaction, category: Optional[str], subcategory: Optional[str], new_name: str):
+    if not category or not subcategory:
+        return await interaction.response.send_message("Pick both category and subcategory.", ephemeral=True)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("UPDATE subcategories SET name=? WHERE id=?", (new_name.strip(), int(subcategory)))
+    con.commit()
+    con.close()
+    await interaction.response.send_message("Subcategory renamed.", ephemeral=True)
+
+@bot.tree.command(name="deletesubcategory", description="Delete a subcategory.")
+@app_commands.describe(category="Choose the parent category", subcategory="Choose a subcategory")
+@app_commands.autocomplete(category=_ac_category, subcategory=_ac_subcategory)
+async def deletesubcategory(interaction: discord.Interaction, category: Optional[str], subcategory: Optional[str]):
+    if not category or not subcategory:
+        return await interaction.response.send_message("Pick both category and subcategory.", ephemeral=True)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("DELETE FROM subcategories WHERE id=?", (int(subcategory),))
+    con.commit()
+    con.close()
+    await interaction.response.send_message("Subcategory deleted.", ephemeral=True)
+
+@bot.tree.command(name="addcard", description="Add a flash card.")
+@app_commands.describe(
+    question="The question/definition",
+    answer="The answer",
+    category="Choose a category (optional)",
+    subcategory="Choose a subcategory (optional)"
+)
+@app_commands.autocomplete(category=_ac_category, subcategory=_ac_subcategory)
+async def addcard(
+    interaction: discord.Interaction,
+    question: str,
+    answer: str,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+):
+    con = db_connect()
+    cur = con.cursor()
+    card_number = generate_card_number(con)
+    cat_id = int(category) if category else None
+    sub_id = int(subcategory) if subcategory else None
+    cur.execute(
+        "INSERT INTO cards(card_number, question, answer, category_id, subcategory_id) VALUES (?,?,?,?,?)",
+        (card_number, question.strip(), answer.strip(), cat_id, sub_id)
+    )
+    con.commit()
+    new_id = cur.lastrowid
+    con.close()
+
+    embed = discord.Embed(title="Card Added", color=discord.Color.blurple())
+    embed.add_field(name="Card #", value=card_number, inline=True)
+    embed.add_field(name="Question", value=question[:1024], inline=False)
+    embed.add_field(name="Answer", value=answer[:1024], inline=False)
+    await interaction.response.send_message(embed=embed, view=CardView(new_id), ephemeral=True)
+
+# ---- List & open cards ----
+
+class ListPageView(discord.ui.View):
+    def __init__(self, entries: List[sqlite3.Row], page: int, per_page: int, cat_id: Optional[int], sub_id: Optional[int]):
+        super().__init__(timeout=300)
+        self.entries = entries
+        self.page = page
+        self.per_page = per_page
+        self.cat_id = cat_id
+        self.sub_id = sub_id
+
+        start = page * per_page
+        page_slice = entries[start:start + per_page]
+
+        # Add a button per card (Discord max 25 components across rows; we cap per_page)
+        for row in page_slice:
+            label = row["question"][:80]
+            self.add_item(OpenCardButton(row["id"], label))
+
+        # Pagination
+        if page > 0:
+            self.add_item(NavButton("Prev", page - 1, cat_id, sub_id))
+        if start + per_page < len(entries):
+            self.add_item(NavButton("Next", page + 1, cat_id, sub_id))
+
+class OpenCardButton(discord.ui.Button):
+    def __init__(self, card_id: int, label_text: str):
+        super().__init__(style=discord.ButtonStyle.primary, label=label_text)
+        self.card_id = card_id
+
+    async def callback(self, interaction: discord.Interaction):
+        card = fetch_card(self.card_id)
+        if not card:
+            return await interaction.response.send_message("Card not found.", ephemeral=True)
+        embed = discord.Embed(
+            title="Card",
+            description=f"**Q:** {card['question']}\n\n**A:** {card['answer']}",
+            color=discord.Color.teal(),
+        )
+        await interaction.response.send_message(embed=embed, view=CardView(self.card_id), ephemeral=True)
+
+class NavButton(discord.ui.Button):
+    def __init__(self, label_text: str, target_page: int, cat_id: Optional[int], sub_id: Optional[int]):
+        super().__init__(style=discord.ButtonStyle.secondary, label=label_text)
+        self.target_page = target_page
+        self.cat_id = cat_id
+        self.sub_id = sub_id
+
+    async def callback(self, interaction: discord.Interaction):
+        entries = fetch_cards(self.cat_id, self.sub_id)
+        per_page = 10
+        view = ListPageView(entries, self.target_page, per_page, self.cat_id, self.sub_id)
+        total = len(entries)
+        start = self.target_page * per_page
+        end = min(start + per_page, total)
+        text = f"Showing {start+1}-{end} of {total} cards."
+        await interaction.response.edit_message(content=text, view=view)
+
+@bot.tree.command(name="listcards", description="List cards with optional filters; click a question to open it.")
+@app_commands.describe(category="Choose a category (optional)", subcategory="Choose a subcategory (optional)")
+@app_commands.autocomplete(category=_ac_category, subcategory=_ac_subcategory)
+async def listcards(
+    interaction: discord.Interaction,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None
+):
+    cat_id = int(category) if category else None
+    sub_id = int(subcategory) if subcategory else None
+    entries = fetch_cards(cat_id, sub_id)
+    if not entries:
+        return await interaction.response.send_message("No cards found.", ephemeral=True)
+
+    per_page = 10
+    view = ListPageView(entries, page=0, per_page=per_page, cat_id=cat_id, sub_id=sub_id)
+    end = min(per_page, len(entries))
+    await interaction.response.send_message(f"Showing 1-{end} of {len(entries)} cards.", view=view, ephemeral=True)
+
+# ---- Review ----
+
+REVIEW_CHOICES = [app_commands.Choice(name="review_20", value="20"),
+                  app_commands.Choice(name="review_50", value="50"),
+                  app_commands.Choice(name="review_all", value="all")]
+
+@bot.tree.command(name="reviewcards", description="Review 20, 50, or all cards. Optional category/subcategory.")
+@app_commands.describe(
+    mode="review_20 / review_50 / review_all",
+    category="Choose a category (optional)",
+    subcategory="Choose a subcategory (optional)"
+)
+@app_commands.choices(mode=REVIEW_CHOICES)
+@app_commands.autocomplete(category=_ac_category, subcategory=_ac_subcategory)
+async def reviewcards(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None
+):
+    cat_id = int(category) if category else None
+    sub_id = int(subcategory) if subcategory else None
+
+    pool = fetch_cards(cat_id, sub_id)
+    if not pool:
+        return await interaction.response.send_message("No cards found for that filter.", ephemeral=True)
+
+    if mode.value == "20":
+        target = min(20, len(pool))
+    elif mode.value == "50":
+        target = min(50, len(pool))
+    else:
+        target = len(pool)
+
+    # Start session: ensure no repeats within the session
+    deck_ids = [row["id"] for row in pool]
+    random.shuffle(deck_ids)
+
+    view = ReviewView(user_id=interaction.user.id, deck_ids=deck_ids, target=target)
+
+    # send first card container
+    await interaction.response.send_message("Review started.", view=view, ephemeral=True)
+
+    # Immediately advance into first question
+    try:
+        await view.start_or_advance(interaction)
+    except discord.errors.InteractionResponded:
+        # If already responded, edit the message we just sent
+        msg = await interaction.original_response()
+        fake_interaction = interaction
+        fake_interaction.message = msg  # attach for downstream editing
+        await view._advance_via_followup(fake_interaction)
+
+# ---------------------------
+# Lifecycle / sync
+# ---------------------------
+@bot.event
+async def setup_hook():
+    # DB migration
+    migrate_schema()
+
+    # Command sync
+    if GUILD_ID:
+        guild = discord.Object(id=int(GUILD_ID))
+        # If commands are global by default, copy to guild for instant availability
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info("Synced %d guild commands.", len(synced))
+    else:
+        synced = await bot.tree.sync()
+        log.info("Synced %d global commands (may take time to appear).", len(synced))
 
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user}")
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
-# ---------------------------- Commands ---------------------------------
-
-# /ping test
-@bot.tree.command(name="ping", description="Test that the bot is alive")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("pong", ephemeral=True)
-
-# /addcategory
-@bot.tree.command(name="addcategory", description="Create a new category")
-@app_commands.describe(name="Category name")
-async def addcategory(interaction: discord.Interaction, name: str):
-    cid = ensure_category(name)
-    await interaction.response.send_message(f"Category **{name}** created (id {cid}).", ephemeral=True)
-
-# /addsubcategory
-@bot.tree.command(name="addsubcategory", description="Create a new subcategory")
-@app_commands.describe(category="Existing category", name="Subcategory name")
-async def addsubcategory(interaction: discord.Interaction, category: str, name: str):
-    # resolve category
-    rows = list_categories(prefix=category)
-    match = next((r for r in rows if r["name"].lower() == category.lower()), None)
-    if not match:
-        await interaction.response.send_message("Category not found. Use autocomplete.", ephemeral=True)
-        return
-    sid = ensure_subcategory(match["id"], name)
-    await interaction.response.send_message(f"Subcategory **{name}** created under **{match['name']}** (id {sid}).", ephemeral=True)
-
-@addsubcategory.autocomplete("category")
-async def ac_category_for_subcat(interaction: discord.Interaction, current: str):
-    options = [app_commands.Choice(name=row["name"], value=row["name"]) for row in list_categories(current)]
-    return options
-
-# /addcard
-@bot.tree.command(name="addcard", description="Add a flashcard (category/subcategory optional)")
-@app_commands.describe(
-    question="Question text (required)",
-    answer="Answer text (required)",
-    category="Optional category",
-    subcategory="Optional subcategory (requires category)"
-)
-async def addcard(interaction: discord.Interaction, question: str, answer: str, category: Optional[str] = None, subcategory: Optional[str] = None):
-    category_id = None
-    subcategory_id = None
-    if category:
-        rows = list_categories(prefix=category)
-        match = next((r for r in rows if r["name"].lower() == category.lower()), None)
-        if not match:
-            category_id = ensure_category(category)
-        else:
-            category_id = match["id"]
-        if subcategory:
-            subcategory_id = ensure_subcategory(category_id, subcategory)
-
-    card_no = add_card(question, answer, category_id, subcategory_id)
-    cat_name = None
-    if category_id:
-        rows = list_categories()
-        cat_row = next((r for r in rows if r["id"] == category_id), None)
-        cat_name = cat_row["name"] if cat_row else None
-    msg = f"Added card **{card_no}**"
-    if cat_name:
-        msg += f" in **{cat_name}**"
-        if subcategory:
-            msg += f" › **{subcategory}**"
-    await interaction.response.send_message(msg + ".", ephemeral=True)
-
-@addcard.autocomplete("category")
-async def ac_category_for_addcard(interaction: discord.Interaction, current: str):
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in list_categories(current)]
-
-@addcard.autocomplete("subcategory")
-async def ac_subcategory_for_addcard(interaction: discord.Interaction, current: str):
-    # pull category param from interaction namespace if present
-    ns = interaction.namespace if hasattr(interaction, "namespace") else None
-    cat = getattr(ns, "category", None) if ns else None
-    if not cat:
-        return []
-    rows = list_categories(prefix=cat)
-    match = next((r for r in rows if r["name"].lower() == str(cat).lower()), None)
-    if not match:
-        return []
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in list_subcategories(match["id"], current)]
-
-# /listcards (simple textual list)
-@bot.tree.command(name="listcards", description="List cards by optional category/subcategory")
-@app_commands.describe(category="Optional category", subcategory="Optional subcategory")
-async def listcards(interaction: discord.Interaction, category: Optional[str] = None, subcategory: Optional[str] = None):
-    cat_id = None; sub_id = None
-    if category:
-        rows = list_categories(prefix=category)
-        match = next((r for r in rows if r["name"].lower() == category.lower()), None)
-        if not match:
-            await interaction.response.send_message("Category not found.", ephemeral=True); return
-        cat_id = match["id"]
-        if subcategory:
-            subs = list_subcategories(cat_id, prefix=subcategory)
-            sm = next((r for r in subs if r["name"].lower() == subcategory.lower()), None)
-            if not sm:
-                await interaction.response.send_message("Subcategory not found.", ephemeral=True); return
-            sub_id = sm["id"]
-
-    cards = get_candidate_cards(cat_id, sub_id)
-    if not cards:
-        await interaction.response.send_message("No cards found.", ephemeral=True); return
-
-    # Sort alphabetically by question
-    cards_sorted = sorted(cards, key=lambda r: r["question"].lower())
-    # Build a compact list
-    lines = []
-    for r in cards_sorted[:200]:  # hard cap to avoid huge messages
-        lines.append(f"• {r['question']}  _(#{r['card_number']})_")
-    text = "\n".join(lines)
-    if len(cards_sorted) > 200:
-        text += f"\n…and {len(cards_sorted) - 200} more."
-
-    await interaction.response.send_message(text or "No cards.", ephemeral=True)
-
-@listcards.autocomplete("category")
-async def ac_category_for_list(interaction: discord.Interaction, current: str):
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in list_categories(current)]
-
-@listcards.autocomplete("subcategory")
-async def ac_subcategory_for_list(interaction: discord.Interaction, current: str):
-    ns = interaction.namespace if hasattr(interaction, "namespace") else None
-    cat = getattr(ns, "category", None) if ns else None
-    if not cat:
-        return []
-    rows = list_categories(prefix=str(cat))
-    match = next((r for r in rows if r["name"].lower() == str(cat).lower()), None)
-    if not match:
-        return []
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in list_subcategories(match["id"], current)]
-
-# ----------------------- Review flow (20/50/all) ----------------------
-REVIEW_SESSION: dict[int, "Session"] = {}  # key: message_id
-
-@dataclass
-class Session:
-    user_id: int
-    remaining: List[int]   # card ids
-    category_id: Optional[int]
-    subcategory_id: Optional[int]
-    total: int
-
-class ReviewView(discord.ui.View):
-    def __init__(self, session_key: int, *, timeout: int = 600):
-        super().__init__(timeout=timeout)
-        self.session_key = session_key
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        sess = REVIEW_SESSION.get(self.session_key)
-        if not sess:
-            await interaction.response.send_message("This session has ended.", ephemeral=True)
-            return False
-        if interaction.user.id != sess.user_id:
-            await interaction.response.send_message("Only the quiz owner can interact.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="I was right ✅", style=discord.ButtonStyle.success)
-    async def right_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await advance_review(interaction, self.session_key, was_right=True)
-
-    @discord.ui.button(label="I was wrong ❌", style=discord.ButtonStyle.danger)
-    async def wrong_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await advance_review(interaction, self.session_key, was_right=False)
-
-async def advance_review(interaction: discord.Interaction, session_key: int, was_right: bool):
-    # Pop next card or finish
-    sess = REVIEW_SESSION.get(session_key)
-    if not sess:
-        await interaction.response.edit_message(content="Session ended.", view=None)
-        return
-
-    if not sess.remaining:
-        # Finished: reward + streak
-        await post_reward_and_streak(interaction, sess.user_id, sess.total)
-        REVIEW_SESSION.pop(session_key, None)
-        return
-
-    # Next card
-    next_id = sess.remaining.pop()
-    row = get_card(next_id)
-    if not row:
-        return await advance_review(interaction, session_key, was_right)  # skip missing
-
-    embed = discord.Embed(title="Flashcard", description=row["question"], colour=discord.Colour.blurple())
-    embed.add_field(name="Answer", value=f"||{row['answer']}||", inline=False)
-
-    view = ReviewView(session_key)
-    await interaction.response.edit_message(embed=embed, view=view)
-
-async def post_reward_and_streak(interaction: discord.Interaction, user_id: int, count: int):
-    # Post reward video if exists
-    reward_file = None
-    if REWARDS_DIR.exists():
-        vids = [p for p in REWARDS_DIR.iterdir() if p.suffix.lower() in REWARD_EXTS]
-        if vids:
-            reward_file = random.choice(vids)
-
-    files = []
-    content = f"🎉 Review complete! You finished **{count}** cards."
-    if reward_file and reward_file.exists():
-        try:
-            files = [discord.File(str(reward_file), filename=reward_file.name)]
-            content = f"🎉 Review complete! Enjoy your reward: **{reward_file.name}**"
-        except Exception as e:
-            log.warning(f"Failed attaching reward: {e}")
-
-    # Increment daily streak
-    streak = mark_reward_and_get_streak(user_id)
-    content2 = f"🔥 Daily streak: **{streak}**"
-
-    if files:
-        await interaction.response.edit_message(content=content + "\n" + content2, attachments=files, embed=None, view=None)
-    else:
-        await interaction.response.edit_message(content=content + "\n" + content2, embed=None, view=None)
-
-@bot.tree.command(name="reviewcards", description="Review 20, 50, or all cards (optionally filter by category/subcategory).")
-@app_commands.describe(
-    mode="How many to review: 20 / 50 / all",
-    category="Optional category filter",
-    subcategory="Optional subcategory (requires category)"
-)
-@app_commands.choices(mode=[
-    app_commands.Choice(name="Review 20", value="20"),
-    app_commands.Choice(name="Review 50", value="50"),
-    app_commands.Choice(name="Review all", value="all")
-])
-async def reviewcards(interaction: discord.Interaction, mode: app_commands.Choice[str], category: Optional[str] = None, subcategory: Optional[str] = None):
-    # Resolve filters
-    cat_id = None; sub_id = None
-    if category:
-        rows = list_categories(prefix=category)
-        match = next((r for r in rows if r["name"].lower() == category.lower()), None)
-        if not match:
-            await interaction.response.send_message("Category not found.", ephemeral=True); return
-        cat_id = match["id"]
-        if subcategory:
-            subs = list_subcategories(cat_id, prefix=subcategory)
-            sm = next((r for r in subs if r["name"].lower() == subcategory.lower()), None)
-            if not sm:
-                await interaction.response.send_message("Subcategory not found.", ephemeral=True); return
-            sub_id = sm["id"]
-
-    cards = get_candidate_cards(cat_id, sub_id)
-    if not cards:
-        await interaction.response.send_message("No cards available for this filter.", ephemeral=True); return
-
-    # Build randomized set with no immediate repeats in this session
-    random.shuffle(cards)
-    if mode.value == "20":
-        chosen = cards[:20]
-    elif mode.value == "50":
-        chosen = cards[:50]
-    else:
-        chosen = cards
-
-    remaining_ids = [r["id"] for r in chosen]
-
-    # Post first card placeholder
-    await interaction.response.send_message(f"Starting review of **{len(remaining_ids)}** cards…", ephemeral=False)
-    msg = await interaction.original_response()
-
-    # Pop first and show
-    if remaining_ids:
-        first_id = remaining_ids.pop()
-        row = get_card(first_id)
-        embed = discord.Embed(title="Flashcard", description=row["question"], colour=discord.Colour.blurple())
-        embed.add_field(name="Answer", value=f"||{row['answer']}||", inline=False)
-    else:
-        embed = discord.Embed(title="Flashcard", description="No cards found.", colour=discord.Colour.red())
-
-    # Store session by message id so buttons can edit same message
-    session_key = msg.id
-    REVIEW_SESSION[session_key] = Session(
-        user_id=interaction.user.id,
-        remaining=remaining_ids,
-        category_id=cat_id,
-        subcategory_id=sub_id,
-        total=len(chosen)
-    )
-    await msg.edit(embed=embed, view=ReviewView(session_key))
-
-@reviewcards.autocomplete("category")
-async def ac_category_for_review(interaction: discord.Interaction, current: str):
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in list_categories(current)]
-
-@reviewcards.autocomplete("subcategory")
-async def ac_subcategory_for_review(interaction: discord.Interaction, current: str):
-    ns = interaction.namespace if hasattr(interaction, "namespace") else None
-    cat = getattr(ns, "category", None) if ns else None
-    if not cat:
-        return []
-    rows = list_categories(prefix=str(cat))
-    match = next((r for r in rows if r["name"].lower() == str(cat).lower()), None)
-    if not match:
-        return []
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in list_subcategories(match["id"], current)]
-
-# ----------------------------- Entrypoint ------------------------------
 def main():
-    # Env checks with helpful logging
-    log.info(f"DISCORD_TOKEN present={bool(DISCORD_TOKEN)} len={len(DISCORD_TOKEN)}")
-    log.info(f"DISCORD_CLIENT_ID present={bool(CLIENT_ID)} len={len(CLIENT_ID)}")
-    log.info(f"DISCORD_GUILD_ID present={bool(GUILD_ID)} value={GUILD_ID}")
-
-    if not DISCORD_TOKEN or not CLIENT_ID or not GUILD_ID:
-        print("Missing one of: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID")
-        raise SystemExit(1)
-
-    # Ensure DB exists & migrate
-    try:
-        migrate_schema()
-    except sqlite3.OperationalError as e:
-        log.error(f"DB migrate failed: {e}")
-        raise
-
-    bot.run(DISCORD_TOKEN)
+    bot.run(TOKEN)
 
 if __name__ == "__main__":
     main()
-
-
