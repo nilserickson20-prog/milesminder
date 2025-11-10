@@ -585,10 +585,12 @@ async def reviewcards(interaction: discord.Interaction,
 # -------------------------
 @bot.event
 async def on_ready():
-    logging.info("Logged in as %s", bot.user)
-    guild = discord.Object(id=GUILD_ID)
-    cmds = await tree.sync(guild=guild)  # fast, guild-scoped sync
-    logging.info("Synced %d commands to guild %s", len(cmds), GUILD_ID)
+    try:
+        guild = discord.Object(int(os.environ["DISCORD_GUILD_ID"]))
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} guild commands.")
+    except Exception as e:
+        print(f"Command sync failed: {e}")
 
 # -------------------------
 # Main
