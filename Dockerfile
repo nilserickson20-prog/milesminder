@@ -18,6 +18,6 @@ RUN mkdir -p /data
 
 # Optional: run as non-root
 RUN useradd -m botuser
-USER botuser
+USER root
 
 CMD ["python", "-m", "milesminder.bot"]
