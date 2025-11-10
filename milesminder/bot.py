@@ -9,24 +9,23 @@ MilesMinder Discord Bot
 - No repeats within a session
 - Optional category/subcategory filters with autocomplete
 - Reward video + daily streak upon successful review session
-- SQLite + SQLAlchemy with safe boot and idempotent indices
+- SQLite + SQLAlchemy with safe boot and idempotent indices + runtime migration
 - Guild-scoped fast sync if DISCORD_GUILD_ID is set
 """
 
 import os
-import io
 import sys
 import random
 import logging
 import datetime as dt
-from typing import Optional, List, Dict, Tuple, Set
+from typing import Optional, List, Dict, Set
 
 import discord
 from discord.ext import commands
 from discord import app_commands
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, ForeignKey, Text, UniqueConstraint, Date, Boolean
+    create_engine, Column, Integer, String, ForeignKey, Text, UniqueConstraint, Date
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session
 
@@ -34,8 +33,10 @@ from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session
 # Logging
 # ------------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 log = logging.getLogger("milesminder")
 
 # ------------------------------------------------------------------------------
@@ -45,7 +46,6 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "")
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
 
-# reward video directory (optional). Place mp4/mov/webm files here in the container/volume.
 REWARD_VIDEOS_DIR = os.environ.get("REWARD_VIDEOS_DIR", "/data/rewards")
 
 if not DISCORD_TOKEN:
@@ -108,15 +108,28 @@ class Streak(Base):
     count = Column(Integer, nullable=False, default=0)
     last_reward_date = Column(Date, nullable=True)
 
-    # Optional: track consecutive-day reset rules or metadata later
-
 
 def init_db():
     Base.metadata.create_all(engine)
-    # safe indices
+    # idempotent indices
     with engine.begin() as conn:
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_cards_category_id ON cards(category_id)")
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_cards_subcategory_id ON cards(subcategory_id)")
+
+    # runtime migrations (safe on every start)
+    with engine.begin() as conn:
+        # Ensure streaks table exists and columns present
+        conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS streaks ("
+            "id INTEGER PRIMARY KEY, "
+            "user_id VARCHAR(32) NOT NULL UNIQUE)"
+        )
+        # Now make sure required columns exist
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info('streaks')").fetchall()}
+        if "count" not in cols:
+            conn.exec_driver_sql("ALTER TABLE streaks ADD COLUMN count INTEGER NOT NULL DEFAULT 0")
+        if "last_reward_date" not in cols:
+            conn.exec_driver_sql("ALTER TABLE streaks ADD COLUMN last_reward_date DATE")
 
 
 init_db()
@@ -158,8 +171,7 @@ def next_card_number(sess: Session) -> str:
     base = sess.query(Card).count() + 1
     while True:
         candidate = f"C{base:06d}"
-        exists = sess.query(Card).filter_by(card_number=candidate).first()
-        if not exists:
+        if not sess.query(Card).filter_by(card_number=candidate).first():
             return candidate
         base += 1
 
@@ -209,9 +221,7 @@ def pick_reward_file() -> Optional[str]:
             return None
         files = [f for f in os.listdir(REWARD_VIDEOS_DIR)
                  if f.lower().endswith((".mp4", ".mov", ".webm", ".m4v"))]
-        if not files:
-            return None
-        return os.path.join(REWARD_VIDEOS_DIR, random.choice(files))
+        return os.path.join(REWARD_VIDEOS_DIR, random.choice(files)) if files else None
     except Exception as e:
         log.warning("Reward file pick failed: %s", e)
         return None
@@ -225,10 +235,8 @@ def increment_daily_streak(sess: Session, user_id: int) -> int:
         sess.add(row)
         sess.commit()
         return row.count
-    # if already rewarded today, keep count
     if row.last_reward_date == today:
         return row.count
-    # if yesterday, increment; else reset to 1
     if row.last_reward_date == (today - dt.timedelta(days=1)):
         row.count += 1
     else:
@@ -273,7 +281,6 @@ async def _ac_categories(interaction: discord.Interaction, current: str) -> List
 
 
 async def _ac_subcategories(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    # Use chosen "category" option if present
     chosen_category = None
     try:
         chosen_category = interaction.namespace.category
@@ -386,9 +393,8 @@ async def listcards(interaction: discord.Interaction, category: Optional[str] = 
         await interaction.response.send_message("No cards found for that filter.", ephemeral=True)
         return
 
-    # No unique id exposed; show question text and where it lives.
     lines = []
-    for c in cards[:200]:  # generous cap
+    for c in cards[:200]:
         cat = c.category.name if c.category else "No Category"
         sub = f" • {c.subcategory.name}" if c.subcategory else ""
         lines.append(f"• **{c.question}** _(in {cat}{sub})_")
@@ -458,32 +464,53 @@ class ReviewView(discord.ui.View):
         next_id = self._pick_next_id()
         if next_id is None:
             self.done = True
-            # reward & streak
+            # First, finish the original ephemeral message
+            try:
+                with db() as sess:
+                    streak_val = increment_daily_streak(sess, self.user_id)
+                await interaction.response.edit_message(
+                    content=f"🎉 Review complete!",
+                    embed=None,
+                    view=None
+                )
+            except discord.InteractionResponded:
+                # If already responded, best effort cleanup
+                try:
+                    await interaction.edit_original_response(content="🎉 Review complete!", attachments=[], view=None)
+                except Exception:
+                    pass
+
+            # Then, send reward via follow-up (this is how we can upload a file)
             reward_path = pick_reward_file()
-            streak_text = ""
-            with db() as sess:
-                streak_val = increment_daily_streak(sess, self.user_id)
-                streak_text = f"🔥 Daily streak: **{streak_val}**"
+            streak_val_local = 0
+            try:
+                with db() as sess:
+                    streak_val_local = sess.query(Streak).filter(Streak.user_id == str(self.user_id)).one().count
+            except Exception:
+                pass
+
+            streak_text = f"🔥 Daily streak: **{streak_val_local}**" if streak_val_local else ""
 
             if reward_path and os.path.isfile(reward_path):
                 try:
                     file = discord.File(reward_path, filename=os.path.basename(reward_path))
-                    await interaction.response.edit_message(
-                        content=f"🎉 Review complete! Enjoy your reward video below.\n\n{streak_text}",
-                        attachments=[file],
-                        embed=None,
-                        view=None
+                    await interaction.followup.send(
+                        content=f"🎬 Reward unlocked!\n{streak_text}",
+                        file=file,
+                        ephemeral=True
                     )
                     return
                 except Exception as e:
-                    log.warning("Failed attaching reward video: %s", e)
+                    log.warning("Failed attaching reward video via followup: %s", e)
 
-            # Fallback: just text
-            await interaction.response.edit_message(
-                content=f"🎉 Review complete!\n\n{streak_text}",
-                embed=None,
-                view=None
-            )
+            # Fallback: text-only follow-up
+            try:
+                await interaction.followup.send(
+                    content=f"🎬 Reward unlocked! (no video found)\n{streak_text}",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
             return
 
         self.current_card_id = next_id
@@ -549,7 +576,6 @@ def main():
     log.info("DISCORD_CLIENT_ID present=%s", bool(DISCORD_CLIENT_ID))
     log.info("DISCORD_GUILD_ID present=%s value=%s", bool(DISCORD_GUILD_ID), DISCORD_GUILD_ID or "N/A")
 
-    # Make sure reward directory exists (optional)
     try:
         os.makedirs(REWARD_VIDEOS_DIR, exist_ok=True)
     except Exception:
