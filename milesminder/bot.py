@@ -508,7 +508,9 @@ class ListCardsView(discord.ui.View):
 @app_commands.describe(category="Filter by category", subcategory="Filter by subcategory")
 @app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
 async def listcards(interaction: discord.Interaction, category: Optional[str] = None, subcategory: Optional[str] = None):
+    # Defer to avoid the 3s timeout while querying/building UI
     await interaction.response.defer(ephemeral=True)
+
     try:
         with db() as sess:
             cat_id = get_category_id_by_name(sess, category) if category else None
@@ -525,27 +527,31 @@ async def listcards(interaction: discord.Interaction, category: Optional[str] = 
                 q = q.filter(Card.subcategory_id == sub_id)
 
             rows: List[Card] = q.all()
-            if not rows:
-                await interaction.followup.send("No cards found for that filter.", ephemeral=True)
-                return
 
-            lines: List[str] = []
-            for c in rows:
-                cat = c.category.name if c.category else "No Category"
-                sub = f" / *{c.subcategory.name}*" if c.subcategory else ""
-                # hyperlink-like formatting using spoiler link to open the card via a button-based UI (from older versions)
-                # Here we just show the question text; buttons for opening/editing are part of your earlier UI flows.
-                lines.append(f"**{_short(c.question, 150)}** — **{cat}**{sub}")
+        if not rows:
+            await interaction.followup.send("No cards found for that filter.", ephemeral=True)
+            return
 
-        title = "Cards" if not category else f"Cards in {category}" + (f" / {subcategory}" if subcategory else "")
-        view = ListCardsView(lines, title=title)
-        await view._send_or_update(interaction)
+        # Build pairs (card_id, question). IDs are NOT shown to the user; they’re used by the buttons.
+        pairs: List[tuple[int, str]] = [(c.id, c.question) for c in rows]
+
+        title = "Cards"
+        if category:
+            title = f"{category}"
+            if subcategory:
+                title = f"{category} / {subcategory}"
+
+        view = ListCardsButtonsView(interaction.user.id, pairs, title=title)
+        summary = f"Found **{len(rows)}** cards. Tap a question to open it."
+        await interaction.followup.send(summary, view=view, ephemeral=True)
+
     except Exception as e:
         log.exception("Error in /listcards")
         try:
             await interaction.followup.send(f"⚠️ Error listing cards: `{type(e).__name__}` — {e}", ephemeral=True)
         except Exception:
             pass
+
 # ---------- end /listcards ----------
 
 
