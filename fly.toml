@@ -5,11 +5,15 @@ primary_region = "iad"
   dockerfile = "Dockerfile"
 
 [env]
+  PYTHONUNBUFFERED = "1"
   DB_PATH = "/data/milesminder.db"
-
-[[mounts]]
-  source = "milesminder_data"
-  destination = "/data"
 
 [processes]
   app = "python -m milesminder.bot"
+
+[mounts]
+  source = "milesminder_data"
+  destination = "/data"
+
+# IMPORTANT: No [[services]] block at all.
+# (Discord bots don't expose HTTP; health checks will otherwise fail.)
