@@ -466,7 +466,7 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
         self.original_message = original_message
         self.title_text = title
 
-        # Pull current values
+        # Pull current Q/A values
         with db() as sess:
             c = (
                 sess.query(Card)
@@ -476,10 +476,8 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
             )
             q_val = c.question if c else ""
             a_val = c.answer if c else ""
-            cat_val = c.category.name if c and c.category else ""
-            sub_val = c.subcategory.name if c and c.subcategory else ""
 
-        # Text inputs (pre-filled)
+        # Labels must be <= 45 chars
         self.q = discord.ui.TextInput(
             label="Question",
             style=discord.TextStyle.paragraph,
@@ -494,25 +492,9 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
             required=True,
             max_length=2000,
         )
-        self.cat = discord.ui.TextInput(
-            label="Category (leave blank for none)",
-            style=discord.TextStyle.short,
-            default=cat_val,
-            required=False,
-            max_length=128,
-        )
-        self.sub = discord.ui.TextInput(
-            label="Subcategory (requires Category; leave blank for none)",
-            style=discord.TextStyle.short,
-            default=sub_val,
-            required=False,
-            max_length=128,
-        )
 
         self.add_item(self.q)
         self.add_item(self.a)
-        self.add_item(self.cat)
-        self.add_item(self.sub)
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.opener_user_id:
@@ -521,15 +503,6 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
 
         new_q = str(self.q.value).strip()
         new_a = str(self.a.value).strip()
-        new_cat = str(self.cat.value).strip()
-        new_sub = str(self.sub.value).strip()
-
-        if new_sub and not new_cat:
-            await interaction.response.send_message(
-                "Please provide a Category if you set a Subcategory.",
-                ephemeral=True
-            )
-            return
 
         with db() as sess:
             c = (
@@ -542,26 +515,13 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
                 await interaction.response.send_message("This card no longer exists.", ephemeral=True)
                 return
 
-            # Update Q/A
+            # Update only Q/A
             c.question = new_q
             c.answer = new_a
-
-            # Update Category/Subcategory
-            if not new_cat:
-                c.category_id = None
-                c.subcategory_id = None
-            else:
-                cat_obj = ensure_category(sess, new_cat)
-                c.category_id = cat_obj.id
-                if new_sub:
-                    sub_obj = ensure_subcategory(sess, cat_obj, new_sub)
-                    c.subcategory_id = sub_obj.id
-                else:
-                    c.subcategory_id = None
-
             sess.commit()
             sess.refresh(c)
 
+        # Refresh the already-posted card embed + restore manage view
         try:
             scope_title = c.category.name if c.category else "Cards"
             if c.category and c.subcategory:
@@ -574,6 +534,7 @@ class EditCardModal(discord.ui.Modal, title="Edit Card"):
             pass
 
         await interaction.response.send_message("Saved changes.", ephemeral=True)
+
 
 def _category_options(sess: Session) -> List[discord.SelectOption]:
     rows = sess.query(Category.name).order_by(Category.name.asc()).all()
