@@ -375,6 +375,98 @@ async def _ac_subcategories(interaction: discord.Interaction, current: str) -> L
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 # ------------------------------------------------------------------------------
+# ---------- Remove Category / Subcategory ----------
+
+@tree.command(name="removecategory", description="Remove a category (cards will be uncategorised)", guild=GUILD_FOR_SYNC)
+@app_commands.describe(name="Category to remove")
+@app_commands.autocomplete(name=_ac_categories)
+async def removecategory(interaction: discord.Interaction, name: str):
+    # Make it quick on the client
+    await interaction.response.defer(ephemeral=True)
+
+    with db() as sess:
+        cat = sess.query(Category).filter(Category.name.ilike(name.strip())).one_or_none()
+        if not cat:
+            await interaction.followup.send(f"Category **{name}** not found.", ephemeral=True)
+            return
+
+        # Count impacts first (for a nice message)
+        affected_cards = sess.query(Card).filter(Card.category_id == cat.id).count()
+        subcat_count = sess.query(Subcategory).filter(Subcategory.category_id == cat.id).count()
+
+        # Null out category & subcategory on affected cards
+        sess.query(Card).filter(Card.category_id == cat.id).update(
+            {Card.category_id: None, Card.subcategory_id: None},
+            synchronize_session=False
+        )
+
+        # Delete subcategories under the category (delete-orphan would handle if removing via relationship,
+        # but this is explicit and avoids loading)
+        sess.query(Subcategory).filter(Subcategory.category_id == cat.id).delete(synchronize_session=False)
+
+        # Finally delete the category
+        sess.delete(cat)
+        sess.commit()
+
+    await interaction.followup.send(
+        f"🗑️ Removed category **{name}**.\n"
+        f"• Uncategorised cards: **{affected_cards}**\n"
+        f"• Subcategories deleted: **{subcat_count}**",
+        ephemeral=True
+    )
+
+
+@tree.command(name="removesubcategory", description="Remove a subcategory (cards will lose the subcategory)", guild=GUILD_FOR_SYNC)
+@app_commands.describe(
+    category="The parent category",
+    subcategory="The subcategory to remove"
+)
+@app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
+async def removesubcategory(
+    interaction: discord.Interaction,
+    category: str,
+    subcategory: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    with db() as sess:
+        # Find category
+        cat = sess.query(Category).filter(Category.name.ilike(category.strip())).one_or_none()
+        if not cat:
+            await interaction.followup.send(f"Category **{category}** not found.", ephemeral=True)
+            return
+
+        # Find subcategory under that category
+        sub = (
+            sess.query(Subcategory)
+            .filter(Subcategory.category_id == cat.id, Subcategory.name.ilike(subcategory.strip()))
+            .one_or_none()
+        )
+        if not sub:
+            await interaction.followup.send(
+                f"Subcategory **{subcategory}** not found under **{category}**.",
+                ephemeral=True
+            )
+            return
+
+        # Count & null out references on cards
+        affected_cards = sess.query(Card).filter(Card.subcategory_id == sub.id).count()
+        sess.query(Card).filter(Card.subcategory_id == sub.id).update(
+            {Card.subcategory_id: None},
+            synchronize_session=False
+        )
+
+        # Delete subcategory
+        sess.delete(sub)
+        sess.commit()
+
+    await interaction.followup.send(
+        f"🗑️ Removed subcategory **{subcategory}** under **{category}**.\n"
+        f"• Cards cleared of this subcategory: **{affected_cards}**",
+        ephemeral=True
+    )
+# ---------- end remove commands ----------
+
 # Slash Commands: addcategory / addsubcategory / addcard
 # ------------------------------------------------------------------------------
 @tree.command(name="ping", description="Health check", guild=GUILD_FOR_SYNC)
