@@ -46,7 +46,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "")
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
 
-REWARD_VIDEOS_DIR = os.environ.get("REWARD_VIDEOS_DIR", "/assets/rewards")
+REWARD_VIDEOS_DIR = os.environ.get("REWARD_VIDEOS_DIR", "/data/rewards")
 
 if not DISCORD_TOKEN:
     log.error("Missing DISCORD_TOKEN")
