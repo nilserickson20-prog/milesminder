@@ -571,43 +571,644 @@ async def reviewcards(interaction: discord.Interaction, mode: str, category: Opt
             await interaction.response.send_message("No cards available for that selection.", ephemeral=True)
             return
 
-        card_ids = [c.id for c in cards]
-        pool, target = _prepare_pool(card_ids, mode)
+from __future__ import annotations
 
-    key = _session_key(user_id, cat_id, sub_id)
-    REVIEW_SESSIONS[key] = {"pool": pool, "target": target, "completed": 0, "last": None}
+import os
+import asyncio
+import logging
+from typing import Optional, List, Dict, Set, Tuple
+from dataclasses import dataclass, field
+import random
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+# Local modules
+from .db import init_db, get_session
+from .models import Category, Subcategory, Card
+from .utils import (
+    ensure_user_stats,
+    mark_daily_activity,       # returns streak int
+    next_reward_video_url,     # returns url or None
+    slugify_name,              # small util to normalise names
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("milesminder.bot")
+
+TOKEN = os.environ.get("DISCORD_TOKEN")
+GUILD_ID = os.environ.get("GUILD_ID")  # optional: restrict sync to a guild
+REWARD_VIDEO_URLS = os.environ.get("REWARD_VIDEO_URLS", "")  # comma-separated optional fallback
+
+intents = discord.Intents.default()
+intents.message_content = True  # for reaction fallbacks and content if needed
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# ----------------------
+# Helpers / DB utilities
+# ----------------------
+
+def _find_category_id_by_name(name: str) -> Optional[int]:
+    if not name:
+        return None
+    with get_session() as db:
+        cat = db.query(Category).filter(Category.name.ilike(name)).first()
+        return cat.id if cat else None
+
+def _find_subcategory_id_by_name(cat_id: int, sub_name: str) -> Optional[int]:
+    if not sub_name or not cat_id:
+        return None
+    with get_session() as db:
+        sub = (
+            db.query(Subcategory)
+            .filter(Subcategory.category_id == cat_id)
+            .filter(Subcategory.name.ilike(sub_name))
+            .first()
+        )
+        return sub.id if sub else None
+
+async def _send_card_embed(
+    destination: discord.abc.Messageable,
+    card_id: int,
+    include_buttons: bool = True,
+) -> discord.Message:
+    """Fetch a card inside a short-lived session and send an embed with spoilered answer."""
+    with get_session() as db:
+        c = db.get(Card, card_id)
+        if not c:
+            return await destination.send("Card no longer exists.")
+        question = c.question
+        answer = c.answer
+        number = c.card_number
+        category_id = c.category_id
+        subcategory_id = c.subcategory_id
+
+        # Resolve names without relationships to avoid lazy loads
+        category_name = None
+        if category_id:
+            cat = db.query(Category).get(category_id)
+            category_name = cat.name if cat else None
+        subcategory_name = None
+        if subcategory_id:
+            sub = db.query(Subcategory).get(subcategory_id)
+            subcategory_name = sub.name if sub else None
+
+    title = f"Card #{number}"
+    if category_name:
+        title += f" · {category_name}"
+        if subcategory_name:
+            title += f" › {subcategory_name}"
+
+    embed = discord.Embed(title=title, description=question)
+    embed.add_field(name="Answer", value=f"||{answer}||", inline=False)
+
+    if include_buttons:
+        view = discord.ui.View(timeout=None)
+        view.add_item(ShowEditButton(card_id=card_id))
+        view.add_item(DeleteCardButton(card_id=card_id))
+        return await destination.send(embed=embed, view=view)
+    else:
+        return await destination.send(embed=embed)
+
+def _query_cards(
+    category_id: Optional[int],
+    subcategory_id: Optional[int],
+) -> List[int]:
+    """Return list of card IDs matching scope."""
+    with get_session() as db:
+        q = db.query(Card.id)
+        if category_id:
+            q = q.filter(Card.category_id == category_id)
+        if subcategory_id:
+            q = q.filter(Card.subcategory_id == subcategory_id)
+        return [row[0] for row in q.all()]
+
+async def _sync_commands_for_guild():
+    if GUILD_ID:
+        guild = discord.Object(id=int(GUILD_ID))
+        await tree.sync(guild=guild)
+        log.info("Slash commands synced to guild %s", GUILD_ID)
+    else:
+        await tree.sync()
+        log.info("Slash commands globally synced (can take a bit).")
+
+# ----------------------
+# Autocomplete providers
+# ----------------------
+
+async def _ac_categories(interaction: discord.Interaction, current: str):
+    with get_session() as db:
+        q = db.query(Category).order_by(Category.name.asc())
+        if current:
+            q = q.filter(Category.name.ilike(f"%{current}%"))
+        rows = q.limit(25).all()
+        return [app_commands.Choice(name=c.name, value=c.name) for c in rows]
+
+async def _ac_subcategories(interaction: discord.Interaction, current: str):
+    # Needs the already-typed category to scope suggestions
+    cat_value = interaction.namespace.get("category") if hasattr(interaction, "namespace") else None
+    cat_id = _find_category_id_by_name(cat_value) if cat_value else None
+    if not cat_id:
+        return []
+    with get_session() as db:
+        q = (
+            db.query(Subcategory)
+            .filter(Subcategory.category_id == cat_id)
+            .order_by(Subcategory.name.asc())
+        )
+        if current:
+            q = q.filter(Subcategory.name.ilike(f"%{current}%"))
+        rows = q.limit(25).all()
+        return [app_commands.Choice(name=s.name, value=s.name) for s in rows]
+
+# ----------------------
+# Review session tracking
+# ----------------------
+
+@dataclass
+class ReviewState:
+    user_id: int
+    mode: str  # "20" | "50" | "all"
+    category_id: Optional[int] = None
+    subcategory_id: Optional[int] = None
+    pool: List[int] = field(default_factory=list)     # remaining candidates (IDs)
+    answered: Set[int] = field(default_factory=set)   # correctly answered in this session
+    used: Set[int] = field(default_factory=set)       # seen in this session (for variety)
+    message_id: Optional[int] = None
+
+# key by (channel_id, user_id) to keep one session per user per channel
+active_reviews: Dict[Tuple[int, int], ReviewState] = {}
+
+def _build_pool(all_ids: List[int], mode: str) -> List[int]:
+    ids = list(all_ids)
+    random.shuffle(ids)
+    if mode == "20":
+        return ids[:20]
+    if mode == "50":
+        return ids[:50]
+    return ids
+
+async def _finish_review(interaction: discord.Interaction, state: ReviewState):
+    # Reward
+    url = next_reward_video_url(REWARD_VIDEO_URLS)
+    if url:
+        await interaction.followup.send(url)
+    # Streak
+    streak = 0
+    try:
+        with get_session() as db:
+            ensure_user_stats(db, interaction.user.id)
+            streak = mark_daily_activity(db, interaction.user.id)
+    except Exception as e:
+        log.warning("Failed to mark streak: %s", e)
+    await interaction.followup.send(f"Nice work — session complete! Streak: **{streak} 🔥**")
+
+async def _post_next_card_interaction(
+    interaction: discord.Interaction,
+    state: ReviewState,
+) -> None:
+    """Pick a next not-yet-correct card from pool, avoiding immediate repeats if possible."""
+    # Determine candidate
+    candidates = [cid for cid in state.pool if cid not in state.answered]
+    if not candidates:
+        await _finish_review(interaction, state)
+        active_reviews.pop((interaction.channel_id, interaction.user.id), None)
+        return
+
+    # Try to pick one not used very recently
+    random.shuffle(candidates)
+    for cid in candidates:
+        if cid not in state.used:
+            chosen = cid
+            break
+    else:
+        # all have been used; allow reuse
+        chosen = candidates[0]
+
+    state.used.add(chosen)
+    # Send the card
+    msg = await _send_card_embed(interaction.followup, card_id=chosen, include_buttons=True)
+    state.message_id = msg.id
+
+# ----------------------
+# UI Components (List view / Show / Edit / Delete)
+# ----------------------
+
+class ShowEditButton(discord.ui.Button):
+    def __init__(self, card_id: int):
+        super().__init__(label="Edit", style=discord.ButtonStyle.secondary, custom_id=f"edit:{card_id}")
+        self.card_id = card_id
+
+    async def callback(self, interaction: discord.Interaction):
+        # Present a modal to edit question/answer
+        with get_session() as db:
+            c = db.get(Card, self.card_id)
+            if not c:
+                await interaction.response.send_message("Card no longer exists.", ephemeral=True)
+                return
+            question = c.question
+            answer = c.answer
+
+        modal = EditCardModal(card_id=self.card_id, question=question, answer=answer)
+        await interaction.response.send_modal(modal)
+
+class DeleteCardButton(discord.ui.Button):
+    def __init__(self, card_id: int):
+        super().__init__(label="Delete", style=discord.ButtonStyle.danger, custom_id=f"del:{card_id}")
+        self.card_id = card_id
+
+    async def callback(self, interaction: discord.Interaction):
+        # Ask for confirmation via ephemeral buttons
+        view = ConfirmDeleteView(card_id=self.card_id)
+        await interaction.response.send_message("Delete this card?", view=view, ephemeral=True)
+
+class ConfirmDeleteView(discord.ui.View):
+    def __init__(self, card_id: int):
+        super().__init__(timeout=30)
+        self.card_id = card_id
+
+    @discord.ui.button(label="Yes, delete", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        with get_session() as db:
+            c = db.get(Card, self.card_id)
+            if not c:
+                await interaction.response.edit_message(content="Already gone.", view=None)
+                return
+            db.delete(c)
+        await interaction.response.edit_message(content="Deleted.", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+class EditCardModal(discord.ui.Modal, title="Edit Card"):
+    question = discord.ui.TextInput(label="Question", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+    answer = discord.ui.TextInput(label="Answer", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+
+    def __init__(self, card_id: int, question: str, answer: str):
+        super().__init__()
+        self.card_id = card_id
+        self.question.default = question
+        self.answer.default = answer
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        with get_session() as db:
+            c = db.get(Card, self.card_id)
+            if not c:
+                await interaction.response.send_message("Card no longer exists.", ephemeral=True)
+                return
+            c.question = str(self.question)
+            c.answer = str(self.answer)
+        await interaction.response.send_message("Saved.", ephemeral=True)
+
+# -------------
+# Slash commands
+# -------------
+
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s", bot.user)
+    try:
+        init_db()
+    except Exception as e:
+        log.exception("DB init failed: %s", e)
+    # Sync commands on startup
+    try:
+        await _sync_commands_for_guild()
+    except Exception as e:
+        log.warning("Slash sync failed: %s", e)
+
+@tree.command(description="Create a category")
+@app_commands.describe(name="Category name")
+async def addcategory(interaction: discord.Interaction, name: str):
+    name = name.strip()
+    with get_session() as db:
+        exists = db.query(Category).filter(Category.name.ilike(name)).first()
+        if exists:
+            await interaction.response.send_message("Category already exists.", ephemeral=True)
+            return
+        c = Category(name=name)
+        db.add(c)
+    await interaction.response.send_message(f"Added category **{name}**.", ephemeral=True)
+
+@tree.command(description="Create a subcategory in a category")
+@app_commands.describe(category="Pick a category", name="Subcategory name")
+@app_commands.autocomplete(category=_ac_categories)
+async def addsubcategory(interaction: discord.Interaction, category: str, name: str):
+    cat_id = _find_category_id_by_name(category)
+    if not cat_id:
+        await interaction.response.send_message("Category not found.", ephemeral=True)
+        return
+    name = name.strip()
+    with get_session() as db:
+        exists = (
+            db.query(Subcategory)
+            .filter(Subcategory.category_id == cat_id)
+            .filter(Subcategory.name.ilike(name))
+            .first()
+        )
+        if exists:
+            await interaction.response.send_message("Subcategory already exists.", ephemeral=True)
+            return
+        s = Subcategory(name=name, category_id=cat_id)
+        db.add(s)
+    await interaction.response.send_message(f"Added subcategory **{name}** in **{category}**.", ephemeral=True)
+
+@tree.command(description="Add a flash card")
+@app_commands.describe(
+    question="Question/definition (visible)",
+    answer="Answer (spoilered)",
+    category="Optional category",
+    subcategory="Optional subcategory (if category chosen)",
+)
+@app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
+async def addcard(
+    interaction: discord.Interaction,
+    question: str,
+    answer: str,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+):
+    cat_id = _find_category_id_by_name(category) if category else None
+    sub_id = _find_subcategory_id_by_name(cat_id, subcategory) if (cat_id and subcategory) else None
+
+    with get_session() as db:
+        # auto-generate a unique card_number
+        last = db.query(Card.card_number).order_by(Card.card_number.desc()).first()
+        next_num = (last[0] + 1) if last and last[0] is not None else 1
+        c = Card(
+            card_number=next_num,
+            question=question.strip(),
+            answer=answer.strip(),
+            category_id=cat_id,
+            subcategory_id=sub_id,
+        )
+        db.add(c)
+        # read values before leaving session
+        card_number = next_num
+
+    location_bits = []
+    if category:
+        location_bits.append(category)
+    if subcategory:
+        location_bits.append(subcategory)
+    location = " › ".join(location_bits) if location_bits else "No category"
 
     await interaction.response.send_message(
-        f"Review started: **mode {mode}** — {target} unique card(s) to complete.",
-        ephemeral=True
+        f"Added card **#{card_number}** to **{location}**.", ephemeral=True
     )
 
-    await _post_next_card(
-        channel=interaction.channel,
-        user_id=user_id,
+@tree.command(description="List cards in a category/subcategory (paged)")
+@app_commands.describe(category="Optional category", subcategory="Optional subcategory")
+@app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
+async def listcards(
+    interaction: discord.Interaction,
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+):
+    cat_id = _find_category_id_by_name(category) if category else None
+    sub_id = _find_subcategory_id_by_name(cat_id, subcategory) if (cat_id and subcategory) else None
+
+    with get_session() as db:
+        q = db.query(Card.id, Card.card_number, Card.question)
+        if cat_id:
+            q = q.filter(Card.category_id == cat_id)
+        if sub_id:
+            q = q.filter(Card.subcategory_id == sub_id)
+        rows = q.order_by(Card.question.asc()).all()
+
+    if not rows:
+        await interaction.response.send_message("No cards found.", ephemeral=True)
+        return
+
+    # Paged list with 10 per page, each row has a "Show" button
+    pages: List[List[Tuple[int, int, str]]] = []
+    chunk = []
+    for rid, num, qtext in rows:
+        chunk.append((rid, num, qtext))
+        if len(chunk) == 10:
+            pages.append(chunk)
+            chunk = []
+    if chunk:
+        pages.append(chunk)
+
+    title = "Cards"
+    if category:
+        title += f" – {category}"
+        if subcategory:
+            title += f" › {subcategory}"
+
+    view = CardListView(title=title, pages=pages, current=0)
+    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+
+class CardListView(discord.ui.View):
+    def __init__(self, title: str, pages: List[List[Tuple[int, int, str]]], current: int = 0):
+        super().__init__(timeout=180)
+        self.title = title
+        self.pages = pages
+        self.current = current
+        # Build dynamic buttons for the page
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        self.clear_items()
+        # Add card buttons
+        for rid, num, qtext in self.pages[self.current]:
+            label = f"#{num} · {qtext[:60]}"
+            self.add_item(ShowCardButton(card_id=rid, label=label))
+        # Nav row
+        self.add_item(PrevPageButton())
+        self.add_item(NextPageButton())
+
+    def make_embed(self) -> discord.Embed:
+        e = discord.Embed(title=self.title, description=f"Page {self.current+1}/{len(self.pages)}")
+        for rid, num, qtext in self.pages[self.current]:
+            e.add_field(name=f"#{num}", value=qtext[:200], inline=False)
+        return e
+
+class ShowCardButton(discord.ui.Button):
+    def __init__(self, card_id: int, label: str):
+        super().__init__(label=label, style=discord.ButtonStyle.primary, custom_id=f"show:{card_id}")
+        self.card_id = card_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await _send_card_embed(interaction.followup, self.card_id, include_buttons=True)
+        await interaction.response.defer()  # acknowledge button
+
+class PrevPageButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="◀ Prev", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: CardListView = self.view  # type: ignore
+        if view.current > 0:
+            view.current -= 1
+            view._refresh_buttons()
+            await interaction.response.edit_message(embed=view.make_embed(), view=view)
+        else:
+            await interaction.response.defer()
+
+class NextPageButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Next ▶", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: CardListView = self.view  # type: ignore
+        if view.current < len(view.pages) - 1:
+            view.current += 1
+            view._refresh_buttons()
+            await interaction.response.edit_message(embed=view.make_embed(), view=view)
+        else:
+            await interaction.response.defer()
+
+# REVIEWCARDS
+
+class ReviewCorrectButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✅ Correct", style=discord.ButtonStyle.success, custom_id="rev:ok")
+
+    async def callback(self, interaction: discord.Interaction):
+        key = (interaction.channel_id, interaction.user.id)
+        state = active_reviews.get(key)
+        if not state or not state.message_id:
+            await interaction.response.defer()
+            return
+
+        # Identify current card as the last message we sent — we don't strictly store it, but we can
+        # resolve by reading the last embed? Simpler: store current as last used in state.used
+        # We'll track current by setting on message send. For simplicity, pick last added in used.
+        if not state.used:
+            await interaction.response.defer()
+            return
+        current_id = next(iter(state.used.__reversed__())) if hasattr(state.used, "__reversed__") else list(state.used)[-1]
+        state.answered.add(current_id)
+        await interaction.response.defer()
+        await _post_next_card_interaction(interaction, state)
+
+class ReviewWrongButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="❌ Incorrect", style=discord.ButtonStyle.danger, custom_id="rev:nok")
+
+    async def callback(self, interaction: discord.Interaction):
+        key = (interaction.channel_id, interaction.user.id)
+        state = active_reviews.get(key)
+        if not state:
+            await interaction.response.defer()
+            return
+        # incorrect: do nothing except move on
+        await interaction.response.defer()
+        await _post_next_card_interaction(interaction, state)
+
+class ReviewView(discord.ui.View):
+    def __init__(self, session_key: Tuple[int, int]):
+        super().__init__(timeout=None)
+        self.session_key = session_key
+        self.add_item(ReviewCorrectButton())
+        self.add_item(ReviewWrongButton())
+
+@tree.command(description="Review cards (20, 50, or all) optionally by category/subcategory")
+@app_commands.describe(
+    mode="Pick a review length",
+    category="Optional category to scope",
+    subcategory="Optional subcategory (needs category)"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Review 20", value="20"),
+    app_commands.Choice(name="Review 50", value="50"),
+    app_commands.Choice(name="Review All", value="all"),
+])
+@app_commands.autocomplete(category=_ac_categories, subcategory=_ac_subcategories)
+async def reviewcards(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+):
+    await interaction.response.defer(thinking=True)
+
+    cat_id = _find_category_id_by_name(category) if category else None
+    sub_id = _find_subcategory_id_by_name(cat_id, subcategory) if (cat_id and subcategory) else None
+
+    ids = _query_cards(cat_id, sub_id)
+    if not ids:
+        await interaction.followup.send("No cards found for that scope.")
+        return
+
+    pool = _build_pool(ids, mode.value)
+    if not pool:
+        await interaction.followup.send("No cards available for the chosen mode/scope.")
+        return
+
+    # Create/replace state
+    key = (interaction.channel_id, interaction.user.id)
+    state = ReviewState(
+        user_id=interaction.user.id,
+        mode=mode.value,
         category_id=cat_id,
         subcategory_id=sub_id,
+        pool=pool,
     )
+    active_reviews[key] = state
 
-@reviewcards.autocomplete("category")
-async def ac_review_category(interaction: discord.Interaction, current: str):
-    return [app_commands.Choice(name=n, value=n) for n in _category_names(current)]
+    # Post initial controls message with buttons (for review session)
+    view = ReviewView(session_key=key)
+    await interaction.followup.send("Review started. Use the buttons to grade each card.", view=view)
 
-@reviewcards.autocomplete("subcategory")
-async def ac_review_subcategory(interaction: discord.Interaction, current: str):
-    return [app_commands.Choice(name=n, value=n.split(' ▸ ')[-1]) for n in _subcategory_names(current)]
+    # And post the first card
+    await _post_next_card_interaction(interaction, state)
 
-# ---------------------------------------------------------------------------
+# Edit & delete slash commands (simple direct operations)
+
+@tree.command(description="Delete a card by its number")
+@app_commands.describe(card_number="The card number to delete")
+async def deletecard(interaction: discord.Interaction, card_number: int):
+    with get_session() as db:
+        c = db.query(Card).filter(Card.card_number == card_number).first()
+        if not c:
+            await interaction.response.send_message("Not found.", ephemeral=True)
+            return
+        db.delete(c)
+    await interaction.response.send_message(f"Deleted card #{card_number}.", ephemeral=True)
+
+@tree.command(description="Edit a card by its number")
+@app_commands.describe(card_number="Card number", question="New question (optional)", answer="New answer (optional)")
+async def editcard(
+    interaction: discord.Interaction,
+    card_number: int,
+    question: Optional[str] = None,
+    answer: Optional[str] = None,
+):
+    with get_session() as db:
+        c = db.query(Card).filter(Card.card_number == card_number).first()
+        if not c:
+            await interaction.response.send_message("Not found.", ephemeral=True)
+            return
+        if question:
+            c.question = question
+        if answer:
+            c.answer = answer
+    await interaction.response.send_message(f"Updated card #{card_number}.", ephemeral=True)
+
+# Manual command sync if ever needed
+@tree.command(description="Sync slash commands (admin)")
+async def sync(interaction: discord.Interaction):
+    await _sync_commands_for_guild()
+    await interaction.response.send_message("Synced.", ephemeral=True)
+
+# -------------
 # Entrypoint
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
+# -------------
+
+def main():
     if not TOKEN:
-        logging.error("DISCORD_TOKEN is missing (set it in Fly secrets).")
-        time.sleep(60)
+        log.error("DISCORD_TOKEN is not set")
         raise SystemExit(1)
-    try:
-        bot.run(TOKEN)
-    except Exception:
-        logging.exception("Fatal error during startup")
-        time.sleep(60)
-        raise
+    bot.run(TOKEN)
+
+if __name__ == "__main__":
+    main()
