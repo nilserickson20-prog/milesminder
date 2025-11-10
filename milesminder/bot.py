@@ -1,3 +1,17 @@
+import os, logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def _has(v): 
+    x = os.environ.get(v)
+    return f"{v} present={bool(x)} len={len(x) if x else 0}"
+
+logging.info(_has("DISCORD_TOKEN"))
+logging.info(_has("DISCORD_CLIENT_ID"))
+logging.info(_has("DISCORD_GUILD_ID"))
+
+if not (os.environ.get("DISCORD_TOKEN") and os.environ.get("DISCORD_CLIENT_ID") and os.environ.get("DISCORD_GUILD_ID")):
+    print("Missing one of: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID")
+    raise SystemExit(1)
 from __future__ import annotations
 
 import os
