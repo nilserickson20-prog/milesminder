@@ -587,15 +587,24 @@ async def reviewcards(
     random.shuffle(deck_ids)
 
     view = ReviewView(user_id=interaction.user.id, deck_ids=deck_ids, target=target)
-    await interaction.response.send_message("Review started.", view=view, ephemeral=True)
 
-    try:
-        await view.start_or_advance(interaction)
-    except discord.errors.InteractionResponded:
-        msg = await interaction.original_response()
-        fake = interaction
-        fake.message = msg
-        await view._show_answer_then_next(fake)  # forces first advance path
+    # Pick the first card BEFORE responding so we only respond once
+    first_id = view._pick_next_id()
+    if first_id is None:
+        # Edge-case: empty after filters
+        return await interaction.response.send_message("No cards available.", ephemeral=True)
+
+    view.current_card_id = first_id
+    view.asked.add(first_id)
+
+    card = fetch_card(first_id)
+    if not card:
+        return await interaction.response.send_message("Failed to load the first card.", ephemeral=True)
+
+    embed = discord.Embed(title="Question", description=card["question"], color=discord.Color.blurple())
+    # Send the first question as the initial response. From here on, buttons will edit this message.
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 
 # ---------------------------
 # Lifecycle / Sync
