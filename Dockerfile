@@ -5,24 +5,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates tzdata build-essential sqlite3 \
   && rm -rf /var/lib/apt/lists/*
 
-# Workdir
 WORKDIR /app
 
-# Copy code first to leverage docker layer caching
+# Copy app code first (so edits rebuild only these layers)
 COPY milesminder/ milesminder/
-COPY pyproject.toml requirements.txt* ./
 
-# Install deps
-# Prefer requirements.txt; if you only have pyproject, swap the pip command accordingly.
-RUN pip install --no-cache-dir -r requirements.txt \
-    || pip install --no-cache-dir .
+# Install Python deps from requirements.txt (repo root)
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Ensure data dir exists (Fly volume will mount here if configured)
 RUN mkdir -p /data
 
-# Non-root (optional but recommended)
+# (Optional) run as non-root
 RUN useradd -m botuser
 USER botuser
 
-# Run
 CMD ["python", "-m", "milesminder.bot"]
+
