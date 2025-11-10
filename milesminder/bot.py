@@ -25,7 +25,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, ForeignKey, Text, UniqueConstraint, Date
+    create_engine, Column, Integer, String, ForeignKey, Text, UniqueConstraint, Date, func
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session, joinedload  # ← joinedload added
 
@@ -602,7 +602,8 @@ async def listcards(interaction: discord.Interaction, category: Optional[str] = 
             q = (
                 sess.query(Card)
                 .options(joinedload(Card.category), joinedload(Card.subcategory))
-                .order_by(Card.card_number.asc())
+            -   .order_by(Card.card_number.asc())
+            +   .order_by(func.lower(Card.question).asc())
             )
             if cat_id:
                 q = q.filter(Card.category_id == cat_id)
