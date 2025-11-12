@@ -1339,12 +1339,6 @@ async def task(interaction: discord.Interaction, text: str):
     channel = interaction.channel
     msg = await channel.send(embed=embed)
 
-    # Add a ✅ to make it easy for users to mark complete
-    try:
-        await msg.add_reaction("✅")
-    except Exception:
-        pass
-
     # Persist so we can catch reactions after restarts
     with db() as sess:
         rec = TaskMessage(
