@@ -551,6 +551,7 @@ async def addcard(
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
 ):
+    # Create the card, then take a safe snapshot for rendering
     with db() as sess:
         cat_obj = None
         sub_obj = None
@@ -571,21 +572,35 @@ async def addcard(
         sess.commit()
         sess.refresh(card)
 
-    # Build the title for the embed based on current cat/sub
-    scope_title = card.category.name if card.category else "Cards"
-    if card.category and card.subcategory:
-        scope_title = f"{card.category.name} ▸ {card.subcategory.name}"
+        # Snapshot with names while session is active (avoids DetachedInstanceError)
+        snap = fetch_card_dict(sess, card.id)
+        card_id = card.id
+        card_number = card.card_number
 
-    # 1) Send the card embed immediately (ephemeral to the creator)
-    embed = _embed_card_display(scope_title, card)
+    # Build the scope title and embed from the snapshot (no relationship access here)
+    if snap["category_name"] and snap["subcategory_name"]:
+        scope_title = f'{snap["category_name"]} ▸ {snap["subcategory_name"]}'
+    elif snap["category_name"]:
+        scope_title = snap["category_name"]
+    else:
+        scope_title = "Cards"
+
+    desc = f"**Q**: {snap['question']}\n\n**A**: ||{snap['answer']}||"
+    footer_bits = []
+    footer_bits.append(snap["category_name"] or "No Category")
+    if snap["subcategory_name"]:
+        footer_bits.append(snap["subcategory_name"])
+    footer = " ▸ ".join(footer_bits)
+
+    embed = discord.Embed(title=scope_title, description=desc, colour=discord.Colour.blurple())
+    embed.set_footer(text=f"{footer} • {card_number}")
+
+    # Send the card to the user ephemerally, then attach the edit view immediately
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # 2) Grab the message we just sent
     msg = await interaction.original_response()
 
-    # 3) Swap in the edit view right away, so the user can open the Q/A modal instantly
     try:
-        view = EditCatSubView(interaction.user.id, card.id, msg, scope_title)
+        view = EditCatSubView(interaction.user.id, card_id, msg, scope_title)
         await msg.edit(view=view)
     except Exception as e:
         log.warning("Failed to attach EditCatSubView after addcard: %s", e)
@@ -1301,7 +1316,7 @@ async def mystats(interaction: discord.Interaction):
         embed.set_footer(text=f"Last streak update: {s.last_reward_date.isoformat()}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# -------------------- NEW: /task (public task + ✅ compliments) --------------------
+# -------------------- /task (no "user used /task" banner) --------------------
 @tree.command(
     name="task",
     description="Post a public task for everyone to complete (react with ✅ when done).",
@@ -1309,16 +1324,26 @@ async def mystats(interaction: discord.Interaction):
 )
 @app_commands.describe(text="The task to post")
 async def task(interaction: discord.Interaction, text: str):
-    # Public post
+    # Silently acknowledge the slash command so no "user used /task" banner shows
+    await interaction.response.defer(ephemeral=True)
+
+    # Compose the visible task message the bot will post to the channel
     embed = discord.Embed(
         title="📝 Task",
         description=text,
         color=discord.Color.blurple()
     )
-    embed.set_footer(text=f"React with ✅ when done")
+    embed.set_footer(text="React with ✅ when done")
 
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
+    # Post publicly as the bot (not as the interaction response)
+    channel = interaction.channel
+    msg = await channel.send(embed=embed)
+
+    # Add a ✅ to make it easy for users to mark complete
+    try:
+        await msg.add_reaction("✅")
+    except Exception:
+        pass
 
     # Persist so we can catch reactions after restarts
     with db() as sess:
@@ -1330,6 +1355,11 @@ async def task(interaction: discord.Interaction, text: str):
         )
         sess.add(rec)
         sess.commit()
+
+    # Quiet confirmation back to the command invoker only
+    await interaction.followup.send("✅ Task posted to the channel.", ephemeral=True)
+# ----------------------------------------------------------------------------- 
+
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
