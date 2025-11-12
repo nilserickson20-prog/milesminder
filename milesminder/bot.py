@@ -188,21 +188,21 @@ init_db()
 
 # -------------------- NEW: COMPLIMENTS FOR /task --------------------
 COMPLIMENTS: List[str] = [
-    "Ice cold focus. Nicely done. ❄️",
-    "Chef’s kiss on that task. 👨‍🍳💋",
-    "You just made productivity look easy. ✨",
-    "Another one bites the dust—legend. 🦾",
-    "That’s how winners do it. 🏁",
-    "Brains and discipline—dangerous combo. ⚡️",
-    "You’re on a roll—don’t stop now. 🧈🥖",
-    "Clean execution. Textbook stuff. 📘",
-    "That task never stood a chance. 🗡️",
-    "Elite work—filed under ‘inevitable’. 📂",
-    "Ruthless efficiency. I approve. ✅",
-    "Beautiful. Minimal effort, maximal result. 🧭",
-    "You just fed the streak monster. 🍖🔥",
-    "Precision strike complete. 🎯",
-    "Officially unstoppable today. 🚀",
+    "Verdict’s in: you’re guilty of being brilliant and distractingly attractive.",
+    "I’d say ‘case closed,’ but I kind of hope you keep working...I like watching you.",
+    "Well, well, someone’s earning extra credit in charm and effort today.",
+    "Careful, Counselor — at this rate I’ll be the one falling under your cross-examination.",
+    "Focus like that should be illegal. I might have to file a motion for distraction.",
+    "You call that studying? Looked a lot like seduction from here.",
+    "I hereby sentence you to one very flirty congratulations message. Consider it served.",
+    "You’re so on top of your work — and it’s making me a little jealous I’m not what’s under you.",
+    "You passed that task with flying colours...and one shade of red (mine).",
+    "If discipline were a crime, you’d be doing life without parole — and I’d happily visit.",
+    "I’d say ‘well done,’ but you make it sound a lot better when I say it slowly.",
+    "You’re dangerously close to earning a reward that’s not multiple choice.",
+    "That kind of productivity should come with a warning label: highly attractive.",
+    "Good thing you’re studying law, because you just stole my attention.",
+    "You make closing arguments sound like love letters.",
 ]
 # --------------------------------------------------------------------
 
