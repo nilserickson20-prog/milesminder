@@ -569,12 +569,27 @@ async def addcard(
         )
         sess.add(card)
         sess.commit()
+        sess.refresh(card)
 
-    loc = subcategory or category or "No Category"
-    await interaction.response.send_message(
-        f"✅ Added **{number}** to **{loc}**.",
-        ephemeral=True,
-    )
+    # Build the title for the embed based on current cat/sub
+    scope_title = card.category.name if card.category else "Cards"
+    if card.category and card.subcategory:
+        scope_title = f"{card.category.name} ▸ {card.subcategory.name}"
+
+    # 1) Send the card embed immediately (ephemeral to the creator)
+    embed = _embed_card_display(scope_title, card)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # 2) Grab the message we just sent
+    msg = await interaction.original_response()
+
+    # 3) Swap in the edit view right away, so the user can open the Q/A modal instantly
+    try:
+        view = EditCatSubView(interaction.user.id, card.id, msg, scope_title)
+        await msg.edit(view=view)
+    except Exception as e:
+        log.warning("Failed to attach EditCatSubView after addcard: %s", e)
+
 
 # ------------------------------------------------------------------------------
 # Button-based list + editing helpers
@@ -1300,16 +1315,10 @@ async def task(interaction: discord.Interaction, text: str):
         description=text,
         color=discord.Color.blurple()
     )
-    embed.set_footer(text=f"Posted by {interaction.user.display_name} • React with ✅ when done")
+    embed.set_footer(text=f"React with ✅ when done")
 
     await interaction.response.send_message(embed=embed)
     msg = await interaction.original_response()
-
-    # Add a ✅ to make it easy
-    try:
-        await msg.add_reaction("✅")
-    except Exception:
-        pass
 
     # Persist so we can catch reactions after restarts
     with db() as sess:
