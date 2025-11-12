@@ -127,6 +127,16 @@ class Missed(Base):
 
     __table_args__ = (UniqueConstraint("user_id", "card_id", name="uq_missed_user_card"),)
 
+# -------------------- NEW MODEL FOR /task --------------------
+class TaskMessage(Base):
+    __tablename__ = "task_messages"
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(String(32), nullable=False)
+    message_id = Column(String(32), nullable=False, unique=True)
+    creator_user_id = Column(String(32), nullable=False)
+    task_text = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=dt.datetime.utcnow)
+# -------------------------------------------------------------
 
 def init_db():
     Base.metadata.create_all(engine)
@@ -162,8 +172,39 @@ def init_db():
             "UNIQUE(user_id, card_id))"
         )
 
+        # -------------------- NEW TABLE FOR /task --------------------
+        conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS task_messages ("
+            "id INTEGER PRIMARY KEY, "
+            "channel_id VARCHAR(32) NOT NULL, "
+            "message_id VARCHAR(32) NOT NULL UNIQUE, "
+            "creator_user_id VARCHAR(32) NOT NULL, "
+            "task_text TEXT NOT NULL, "
+            "created_at DATETIME NOT NULL)"
+        )
+        # ------------------------------------------------------------
 
 init_db()
+
+# -------------------- NEW: COMPLIMENTS FOR /task --------------------
+COMPLIMENTS: List[str] = [
+    "Ice cold focus. Nicely done. ❄️",
+    "Chef’s kiss on that task. 👨‍🍳💋",
+    "You just made productivity look easy. ✨",
+    "Another one bites the dust—legend. 🦾",
+    "That’s how winners do it. 🏁",
+    "Brains and discipline—dangerous combo. ⚡️",
+    "You’re on a roll—don’t stop now. 🧈🥖",
+    "Clean execution. Textbook stuff. 📘",
+    "That task never stood a chance. 🗡️",
+    "Elite work—filed under ‘inevitable’. 📂",
+    "Ruthless efficiency. I approve. ✅",
+    "Beautiful. Minimal effort, maximal result. 🧭",
+    "You just fed the streak monster. 🍖🔥",
+    "Precision strike complete. 🎯",
+    "Officially unstoppable today. 🚀",
+]
+# --------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
 # DB Helpers
@@ -1245,6 +1286,86 @@ async def mystats(interaction: discord.Interaction):
         embed.set_footer(text=f"Last streak update: {s.last_reward_date.isoformat()}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# -------------------- NEW: /task (public task + ✅ compliments) --------------------
+@tree.command(
+    name="task",
+    description="Post a public task for everyone to complete (react with ✅ when done).",
+    guild=GUILD_FOR_SYNC
+)
+@app_commands.describe(text="The task to post")
+async def task(interaction: discord.Interaction, text: str):
+    # Public post
+    embed = discord.Embed(
+        title="📝 Task",
+        description=text,
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"Posted by {interaction.user.display_name} • React with ✅ when done")
+
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+
+    # Add a ✅ to make it easy
+    try:
+        await msg.add_reaction("✅")
+    except Exception:
+        pass
+
+    # Persist so we can catch reactions after restarts
+    with db() as sess:
+        rec = TaskMessage(
+            channel_id=str(msg.channel.id),
+            message_id=str(msg.id),
+            creator_user_id=str(interaction.user.id),
+            task_text=text,
+        )
+        sess.add(rec)
+        sess.commit()
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # Ignore bot reactions
+    if payload.user_id == bot.user.id:
+        return
+
+    # We only care about ✅
+    try:
+        if str(payload.emoji) != "✅":
+            return
+    except Exception:
+        return
+
+    # Check if it's one of our task messages
+    with db() as sess:
+        rec: TaskMessage | None = (
+            sess.query(TaskMessage)
+            .filter(TaskMessage.message_id == str(payload.message_id))
+            .one_or_none()
+        )
+
+    if not rec:
+        return
+
+    # Fetch channel/message and reply with a random compliment
+    channel = bot.get_channel(int(rec.channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(rec.channel_id))
+        except Exception:
+            return
+
+    compliment = random.choice(COMPLIMENTS)
+    user_mention = f"<@{payload.user_id}>"
+    try:
+        msg = await channel.fetch_message(int(rec.message_id))
+        await msg.reply(f"{user_mention} {compliment}")
+    except Exception:
+        try:
+            await channel.send(f"{user_mention} {compliment}")
+        except Exception:
+            pass
+# -----------------------------------------------------------------------------------
+
 # ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
@@ -1263,4 +1384,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
